@@ -1,0 +1,8 @@
+build/
+reference/
+tmp/
+
+.mxr_cache/
+
+ArtCNN_R8F64_fp16*.png
+.dsh-managed-access.json

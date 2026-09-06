@@ -1,0 +1,3 @@
+build/
+hip_winograd
+wmma_bench
