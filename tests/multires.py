@@ -41,9 +41,21 @@ _hip_provider_so = os.environ.get(
     "HIP_PROVIDER_SO",
     str(PROJECT_ROOT / "src/hip/build/libonnxruntime_providers_hip.so"),
 )
-if os.path.exists(_hip_provider_so):
-    _pybind_state.register_execution_provider_library(
-        "HIPExecutionProvider", _hip_provider_so
+if not os.path.exists(_hip_provider_so):
+    raise SystemExit(
+        f"HIP provider library not found: {_hip_provider_so}\n"
+        f"Build it first: cd src/hip && ./build.sh"
+    )
+_pybind_state.register_execution_provider_library(
+    "HIPExecutionProvider", _hip_provider_so
+)
+if not any(
+    getattr(d, "ep_name", "") == "HIPExecutionProvider"
+    for d in ort.get_ep_devices()
+):
+    raise SystemExit(
+        "HIPExecutionProvider registration failed "
+        f"(ep devices: {[getattr(d, 'ep_name', d) for d in ort.get_ep_devices()]})"
     )
 
 
@@ -80,6 +92,11 @@ for res in resolutions:
             continue
 
     hip = ort.InferenceSession(str(model_path), _sess_opts, providers=["HIPExecutionProvider"])
+    if hip.get_providers()[0] != "HIPExecutionProvider":
+        raise SystemExit(
+            f"HIP session fell back to {hip.get_providers()} "
+            "(provider failed to take the graph)"
+        )
     _mxr_cache = _mxr_cache_root / f"res{res}"
     _mxr_cache.mkdir(exist_ok=True)
     mig = ort.InferenceSession(

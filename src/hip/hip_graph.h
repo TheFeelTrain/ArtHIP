@@ -51,8 +51,9 @@ struct OpSpec {
   float clip_min = 0.0f;
   float clip_max = 1.0f;
 
-  // DepthToSpace.
+  // DepthToSpace (+ optional fused trailing Clip).
   int blocksize = 1;
+  bool do_clip = false;
 };
 
 struct WeightSpec {

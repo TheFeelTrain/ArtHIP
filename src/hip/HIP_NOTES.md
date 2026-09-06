@@ -124,6 +124,12 @@ Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
 - Kernels: `src/hip/hip_kernels.h` - native wave32 WMMA via
   `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`; shared with `src/hip/`
   execution-provider code.
+- Provider (ORT EP): `src/hip/build.sh` (ORT v1.29.0 sources in git-ignored
+  `tmp/ort129`; vtable defines `-DENABLE_TRAINING -DORT_USE_NCCL
+  -DENABLE_STRIDED_TENSORS` + `-mf16c -mavx2` to match Arch onnxruntime-rocm
+  1.29.0, like vulkanonnx `build_provider_system.sh`; links
+  libonnxruntime_providers_shared). `tests/multires.py` fail-fasts if the
+  .so is missing / registration fails / the session falls back from HIP.
 - Install: `cp src/vapoursynth/hip/build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
 - vsscale: `Backend.HIP` registered in
@@ -155,6 +161,11 @@ SHIPPED (all in build, accuracy-gated vs MIGX on photo: max 0.0024, unchanged):
   fuses the fp16->fp32 output cast, deleting the extra 8M-px cast pass.
   1.24ms -> 1.21ms event; GRAYH path uses dts_kernel_2d. KEPT.
 + Strip 4xhalf4 -> 1xhalf16_t vector copy: neutral, cleaner ISA. KEPT.
++ EP DTS->Clip fusion fix (2026-09-06): kernel had do_clip but host never
+  set it (4-u32 params vs 7-u32 DtsParams) => 8x8 output all zeros, 256
+  maxdiff 0.97 vs CPU. Fixed by Pass 3 (fuse trailing Clip into DTS) +
+  full DtsPush. After fix: 256 maxdiff 0.00098, 1920 maxdiff 0.00134,
+  HIP 66.8 vs MIGX 67.1 ms/iter. KEPT.
 
 REJECTED (do not retry without new evidence):
 - R1 fragment load-consume diet (per-j load+mma+fold, 105 VGPR 8 waves/SIMD):

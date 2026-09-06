@@ -41,9 +41,11 @@ struct BinaryPush {
   uint32_t op;
 };
 
-// DepthToSpace: uint C,H,W,B
+// DepthToSpace: uint C,H,W,B (+ clip fusion: uint do_clip, float min, max)
 struct DtsPush {
   uint32_t c, h, w, b;
+  uint32_t do_clip;
+  float min_val, max_val;
 };
 
 // The conv shader assumes kernel 3x3, stride 1, dilation 1 and equal padding of 1.
@@ -405,6 +407,50 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
       }
     }
     for (auto it = remove_adds.rbegin(); it != remove_adds.rend(); ++it) {
+      ops_.erase(ops_.begin() + static_cast<std::ptrdiff_t>(*it));
+    }
+  }
+
+  // Pass 3: fuse a trailing Clip into the DepthToSpace (the tail is always
+  // DTS -> Clip; the kernel applies the clip inline, saving a full pass).
+  {
+    std::unordered_map<std::string, size_t> producer;
+    for (size_t i = 0; i < ops_.size(); ++i) {
+      producer[ops_[i].out] = i;
+    }
+    std::vector<size_t> remove_clips;
+    for (size_t i = 0; i < ops_.size(); ++i) {
+      if (ops_[i].type != OpType::Clip) {
+        continue;
+      }
+      const auto it = producer.find(ops_[i].in0);
+      if (it == producer.end() || ops_[it->second].type != OpType::DepthToSpace) {
+        continue;
+      }
+      // The Clip input must have no other consumer.
+      bool shared = false;
+      for (size_t j = 0; j < ops_.size(); ++j) {
+        if (j == i || j == it->second) {
+          continue;
+        }
+        const OpSpec& other = ops_[j];
+        if (other.in0 == ops_[i].in0 || other.in1 == ops_[i].in0 ||
+            (other.do_add && other.add_input == ops_[i].in0)) {
+          shared = true;
+          break;
+        }
+      }
+      if (shared) {
+        continue;
+      }
+      OpSpec& dts = ops_[it->second];
+      dts.clip_min = ops_[i].clip_min;
+      dts.clip_max = ops_[i].clip_max;
+      dts.do_clip = true;
+      dts.out = ops_[i].out;
+      remove_clips.push_back(i);
+    }
+    for (auto it = remove_clips.rbegin(); it != remove_clips.rend(); ++it) {
       ops_.erase(ops_.begin() + static_cast<std::ptrdiff_t>(*it));
     }
   }
@@ -772,7 +818,10 @@ common::Status HipGraph::EnsureBuilt(const std::vector<int64_t>& input_shape) {
         p.h = static_cast<uint32_t>(in_shape[1]);
         p.w = static_cast<uint32_t>(in_shape[2]);
         p.b = static_cast<uint32_t>(b);
-        dop.params.resize(4);
+        p.do_clip = op.do_clip ? 1u : 0u;
+        p.min_val = op.clip_min;
+        p.max_val = op.clip_max;
+        dop.params.resize(sizeof(DtsPush) / sizeof(uint32_t));
         std::memcpy(dop.params.data(), &p, sizeof(p));
         dop.dispatch_x = DivCeil(numel, kPointwiseLocal);
         dop.input_buffers = {tensor_map_[op.in0].buffer_index};
