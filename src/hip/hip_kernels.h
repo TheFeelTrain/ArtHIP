@@ -98,7 +98,7 @@ __device__ __forceinline__ void winograd_in4(const _Float16* d, _Float16* v)
     else { Y10 = Y10 - s0; Y11 = Y11 - s1; }                                   \
   }
 
-__global__ __launch_bounds__(128, 4) void winograd_conv(
+__global__ void winograd_conv(
     const _Float16* __restrict__ in, const _Float16* __restrict__ u,
     _Float16* __restrict__ out, const _Float16* __restrict__ add,
     ConvParams p)

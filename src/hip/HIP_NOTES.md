@@ -148,6 +148,9 @@ times (winograd 478ms/8 frames = 2.3ms true exec, not the 2.2ms event span),
 HIP_CONV_SKIP phase toggles, VGPR probe via hsaco notes, ABA benchmarks.
 
 SHIPPED (all in build, accuracy-gated vs MIGX on photo: max 0.0024, unchanged):
++ Drop __launch_bounds__(128,4) (2026-09-06): no-bounds 16.9-17.1 vs 16.7-16.8
++ (128,4) vs 16.7-16.9 (128,8), median-of-3 @120f; VGPR identical (134), no
++ spills either way — the hint only constrained the scheduler. KEPT.
 + Tail-conv wave skip (kgroups<4 waves idle in WMMA/staging/writeback):
   neutral-to-+, kills duplicate-wave waste. KEPT.
 + -ffast-math (build_hip.sh): +2.4% (17.02 -> 17.45 ABA), identical accuracy
@@ -183,22 +186,53 @@ REJECTED (do not retry without new evidence):
 - ds_read2-style B-gather widening: B already loads as 4x half16_t vector
   copies; further widening needs layout change (transposed v_lds was already
   -65% in TRIED table).
+- R6 direct-from-register writeback, INLINE patch attempt (2026-09-06):
+  replaced the staged writeback with per-lane direct stores (ko=k_base+
+  lane/16+2e). WRONG VALUES (photo mean 0.49846 but maxdiff 0.0039/2.3% px
+  vs staged — the D-fragment row->ko mapping needs the per-wpi FOLD4 decode,
+  not the assumed linear map) AND slower (16.55 vs 16.9). REVERTED; R6 stays
+  open only as a separately-validated kernel.
+- Strip half16 b128 widening (2026-09-06): dst[2]=src[2] dropped (copy-paste:
+  2x half16 covers all 16 ch, the extra 2 lines were stale) => black output
+  (mean 0.0037), slower (16.4). REVERTED; the 4x half4 path was already b128
+  in disasm (2x global_load_b128 + 2x ds_store_b128 per cell) — nothing left.
+- Transposed v_lds, SECOND attempt (2026-09-06): CORRECT (maxdiff 0.0059 vs
+  MIGX) but 5.0 fps (-70%). Cause found: VGPR 134 -> 192 WITH spills
+  (161 scratch_ ops); the 4 extra half16 row pointers + 4 extra resident
+  A-frag sets blew the register budget. Layout idea is sound, register cost
+  is not — retry only with a leaner schedule (recompute pointers per wpi,
+  stream A per-group). REVERTED.
+- A-fragment pre-staging across wpi (2026-09-06): same failure signature
+  (192 VGPR + spills, 5 fps). 16 extra live half16 across the wpi loop does
+  not fit. REVERTED.
+- B-gather u32-pair widening (2026-09-06): BLACK output. The u32 reinterpret
+  of the stride-24 LDS row confused the compiler's alias analysis (spills
+  appeared, WMMA operands moved to v89+). REVERTED.
+- Writeback-stage half2 widening (2026-09-06): BLACK output. Staging rows
+  are stride-2 in ko (koff+2e), so element pairs (e,e+1) are NOT adjacent
+  rows — a half2 store writes the wrong row. Not pairable; REVERTED.
 
-MEASURED FACTS (rocprofv3, 8 frames @1080p, sclk 2245MHz / 303W / 100% GPU):
-- winograd: 208 dispatches, 478ms total = 2.30ms true exec each (26 convs x 8).
-- direct_conv: 5.5ms total. dts_in_f32: 0.36ms total (~45us each).
-- SKIP profile (steady-state event spans): full 2.17 / skip-WB 1.99 /
-  skip-WMMA 0.83 / strip-only ~0.5 => strip+V ~0.5, WMMA ~1.2, WB ~0.2.
-- VGPR (hsaco notes): winograd 134 (176 allocated = 6 waves/SIMD; the 128
-  cliff needs <=128). LDS 15744 (4 WGs/CU). No spills anywhere.
-- Frame math: 26 x 2.3 = 60ms compute, but 300 frames in ~17.3s = 57.7ms/frame
-  wall. GPU 100% busy - the convs ARE the frame; ~10% over MIGX, ~8% under
-  the 3080/TensorRT target.
+MEASURED FACTS (rocprofv3, 8 frames @1080p, no-bounds build 2026-09-06):
+- winograd: 208 dispatches, 915ms total = 4.40ms true exec each (26 convs x 8).
+- direct_conv: 8.7ms total (~1.1ms each). dts_in_f32: 0.82ms (~100us each).
+  cast_f32_to_f16: 1.5ms total. Convs = 98.8% of GPU time.
+- VSHIP_PROFILE steady-state (frame 128): op0 (direct) 1.47ms, ops1-20 flat
+  4.35ms, ops21-25 taper 4.2/3.3/2.2/2.2/2.2 (smaller H/feature maps deeper
+  in the chain), op26 4.2, DTS 1.34ms. Event spans include queue gaps; trust
+  shape (flat-then-taper), not absolutes (sums exceed wall time).
+- VGPR (true shipping-kernel disasm tmp/winograd.s, gfx1100): winograd 134
+  (alloc granule 176 = 6 waves/SIMD), no spills. LDS 15744 (4 WGs/CU).
+  WMMA VGPR banks (LLVM#204254): 3 of 4 WMMAs have A/C on bank 1 (collision,
+  +2c each); B on bank 2. Fix needs inline asm (can't steer regalloc from
+  source) — expected gain ~6% of WMMA time only (~1.2ms of 4.4ms), NOT next.
+- Frame math: 26 x 4.4 = 114ms?? vs 300 frames in ~17.5s = 58ms/frame wall.
+  (Event/rocprof sums double-count overlapped streams — GPU 100% busy, the
+  convs ARE the frame; ~15% over MIGX, ~5% under the 3080/TensorRT target.)
 
 NEXT (not tried, in priority order):
-1. VGPR-bank fix (LLVM#204254: A/B/C on distinct banks or +2c/WMMA) - check
-   disasm, near-free if it's allocation order. Then re-attack the 128 cliff
-   ONLY via scheduling (not diets): shrink address/temporary VGPRs.
+1. VGPR-bank fix (LLVM#204254) via inline-asm WMMA wrapper with pinned
+   registers (A/B/C forced to distinct banks): only ~6% of WMMA time, but
+   near-free once written. Validate vs staged output bit-exact first.
 2. Fused tail writeback+DTS (R7-lite): tail conv writes DTS-swizzled output
    directly (saves the 45us DTS + one 8M intermediate). Needs care with the
    D-fragment corner mapping (previous E-series failures); build as a
