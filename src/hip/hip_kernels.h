@@ -120,7 +120,7 @@ __global__ void winograd_conv(
   const uint c_blocks = Cblocks;
 
   __shared__ _Float16 strip4[6 * 18 * 16];
-  __shared__ _Float16 v_lds[16 * 16 * 24];
+  __shared__ _Float16 v_lds[16 * 16 * 20];
 
   float8_t y00 = {}, y01 = {}, y10 = {}, y11 = {};
 
@@ -177,7 +177,7 @@ __global__ void winograd_conv(
         winograd_in4_v4(d4, v4);
         for (uint wp = 0u; wp < 16u; ++wp) {
           for (uint cc = 0u; cc < 4u; ++cc)
-            v_lds[wp * 384u + (c4 + cc) * 24u + nt_local] = v4[wp][cc];
+            v_lds[wp * 320u + (c4 + cc) * 20u + nt_local] = v4[wp][cc];
         }
       }
     }
@@ -202,10 +202,10 @@ __global__ void winograd_conv(
       {
         const uint nt = lane % 16u;
         for (int e = 0; e < 16; ++e) {
-          b0[e] = v_lds[(wpi * 4u + 0u) * 384u + e * 24u + nt];
-          b1[e] = v_lds[(wpi * 4u + 1u) * 384u + e * 24u + nt];
-          b2[e] = v_lds[(wpi * 4u + 2u) * 384u + e * 24u + nt];
-          b3[e] = v_lds[(wpi * 4u + 3u) * 384u + e * 24u + nt];
+          b0[e] = v_lds[(wpi * 4u + 0u) * 320u + e * 20u + nt];
+          b1[e] = v_lds[(wpi * 4u + 1u) * 320u + e * 20u + nt];
+          b2[e] = v_lds[(wpi * 4u + 2u) * 320u + e * 20u + nt];
+          b3[e] = v_lds[(wpi * 4u + 3u) * 320u + e * 20u + nt];
         }
       }
       float8_t m0 = {}, m1 = {}, m2 = {}, m3 = {};

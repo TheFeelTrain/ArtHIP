@@ -140,7 +140,11 @@ Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
 - Run: `MANGOHUD=0 VS_BACKEND=hip vspipe -p tests/vs_test.py --`
   (tests/vs_test.py already routes `hip` to Backend.HIP).
 
-## Speed session (2026-09-06) - HIP 17.2-17.4 vs MIGX 15.7-15.8 (+10%)
+## Speed session (2026-09-06) - HIP 19.3-19.6 vs MIGX 15.5-15.6 (+25%)
+
+Paired 500f (migx-first order, 2026-09-06): HIP 19.43 vs MIGX 15.55 (+25%).
+Photo accuracy vs MIGX unchanged
+(max 0.0057, 0% pixels >0.02). At/above the RTX 3080 TensorRT target band.
 
 Target: RTX 3080 TensorRT does 18-19 fps on this model (similar on-paper fp16
 TFLOPS to the 7900 XTX), so headroom should exist. Method: rocprofv3 kernel
@@ -148,6 +152,15 @@ times (winograd 478ms/8 frames = 2.3ms true exec, not the 2.2ms event span),
 HIP_CONV_SKIP phase toggles, VGPR probe via hsaco notes, ABA benchmarks.
 
 SHIPPED (all in build, accuracy-gated vs MIGX on photo: max 0.0024, unchanged):
++ v_lds stride 24->20 (2026-09-06): 17.0 -> 19.1-19.3 @120f (+12%), 19.56
++ @500f. Bit-exact vs stride-24 (photo maxdiff 0.00571 both, same mean).
++ VGPR unchanged (134), no spills. WHY: stride-24's c-row step (12 banks)
++ revisits 8 bank sets twice per 16-deep gather (8 conflicts/lane); stride-20
++ (step 10 banks) visits all 16 distinct banks, zero c-direction conflicts.
++ Pure win: 12KB->10KB LDS (still 4 WGs/CU), zero new live state. KEPT.
++ (Stride 18 tried: BLACK — nt=16..17 escape the row and collide with the
++ next wp block. 20 is the minimum safe stride for 16-wide nt; do not retry
++ narrower without re-deriving the writeback staging overlap.)
 + Drop __launch_bounds__(128,4) (2026-09-06): no-bounds 16.9-17.1 vs 16.7-16.8
 + (128,4) vs 16.7-16.9 (128,8), median-of-3 @120f; VGPR identical (134), no
 + spills either way — the hint only constrained the scheduler. KEPT.
@@ -211,6 +224,44 @@ REJECTED (do not retry without new evidence):
 - Writeback-stage half2 widening (2026-09-06): BLACK output. Staging rows
   are stride-2 in ko (koff+2e), so element pairs (e,e+1) are NOT adjacent
   rows — a half2 store writes the wrong row. Not pairable; REVERTED.
+- WG=256 reshape, DRAFTED then abandoned pre-build (2026-09-06): splitting
+  8 waves over (kgroup x nt-quad) needs the y-fragment->ko mapping re-derived
+  (each wave owns 16ko x 4nt, not 16ko x 16nt; staging/writeback all change).
+  My draft got the staging indices incoherent (leftover koff algebra,
+  yb collisions); stopped before building rather than debugging blind.
+  Needs a clean-sheet derivation of the per-wave (ko, nt) ownership first.
+- HIP-graph capture of the 29-kernel frame (2026-09-06): BLACK/NaN output.
+  Capture wraps kernels-only (upload before begin, download after end) yet
+  frame 1 comes out NaN — the capture path on this stack (ROCm 7.2) silently
+  breaks something (no API error; diagnostics fprintf never even appeared,
+  suggesting the capture rundll path misbehaves). REVERTED whole (engine
+  files back to HEAD); revisit only with a minimal 2-kernel repro proving
+  capture works on this machine first.
+- LDS XOR-swizzle of v_lds nt lanes (2026-09-06): CORRECT but 4.7 fps.
+  The per-access xor blocked the compiler's LDS address CSE: VGPR 134->192
+  WITH spills (166 scratch ops), ds_load_u16 64->256. Same over-budget
+  signature as transpose/prefetch. REVERTED.
+- Padded-c v_lds stride 24->48 (2026-09-06): CORRECT but 12.1 fps (-29%).
+  24KB LDS halves residency 4->2 WGs/CU and the extra live waves don't
+  compensate — occupancy loss dominates the conflict win. REVERTED.
+  Lesson: LDS budget is load-bearing; stop trading it away.
+
+BIG-LEVER ANALYSIS (2026-09-06, all measured, no code):
+- F(4x4,3x3): KILLED numerically. fp16-transform error ~1-6 per element vs
+  signal ~1-2 (1000x worse than F(2x2)'s ~1e-3); matches published experience
+  (F(4,3) overflows fp16, costs undetected mAP). Would need fp32 transforms
+  (register/LDS blowup) or a different tile (F(2x4) needs LDS redesign).
+- Megakernel/persistent: KILLED by scaling data. Time is linear in pixels
+  (34 Mpix/s from 0.26 to 2 Mpix/frame; 2-wide batch = 2x serial) and each
+  conv's working set (265MB in + 265MB out) exceeds the 256MB L2 — NO reuse
+  is possible across convs (weights 0.13MB are the only reusable bytes, and
+  they already stay L2-resident within a conv). Gap-hunting bounds the prize:
+  s=1-vs-s=2 overlap is worth 9% and we already bank it; residual graph
+  overhead is ~1%. NOT next.
+- True roofline (corrected 2026-09-06): 68 GFLOP/conv, MMA floor 1.1ms @61T
+  vs 4.35ms measured = 26% MMA util (13% of the 123T WMMA peak); DRAM floor
+  0.55ms (8x below). LATENCY-bound at 26%: the B-gather (64 serialized
+  scalar LDS loads + waits per wpi) is the single biggest exposed stall.
 
 MEASURED FACTS (rocprofv3, 8 frames @1080p, no-bounds build 2026-09-06):
 - winograd: 208 dispatches, 915ms total = 4.40ms true exec each (26 convs x 8).
