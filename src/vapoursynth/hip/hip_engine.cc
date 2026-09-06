@@ -59,6 +59,37 @@ __global__ void cast_f16_to_f32(const _Float16* __restrict__ in,
   if (i < n) out[i] = (float)in[i];
 }
 
+// Fused NCHW->NHWC transpose + fp32->fp16 cast for multi-channel fp32 inputs:
+// the ORT-layout upload is NCHW, the compute buffer is NHWC. One thread per
+// (n, h, w) pixel, loops over C (C<=3 for our models; C=1 is a copy).
+__global__ void cast_f32_to_f16_transpose(const float* __restrict__ in,
+                                          _Float16* __restrict__ out,
+                                          uint32_t N, uint32_t C,
+                                          uint32_t H, uint32_t W) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N * H * W) return;
+  const uint32_t n = i / (H * W);
+  const uint32_t hw = i - n * H * W;
+  for (uint32_t c = 0; c < C; ++c) {
+    out[(n * H * W + hw) * C + c] = (_Float16)in[(n * C + c) * H * W + hw];
+  }
+}
+
+// Fused NHWC->NCHW transpose + fp16->fp32 cast for multi-channel fp32
+// outputs: the compute buffer is NHWC, the download is ORT NCHW.
+__global__ void cast_f16_to_f32_transpose(const _Float16* __restrict__ in,
+                                          float* __restrict__ out,
+                                          uint32_t N, uint32_t C,
+                                          uint32_t H, uint32_t W) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N * H * W) return;
+  const uint32_t n = i / (H * W);
+  const uint32_t hw = i - n * H * W;
+  for (uint32_t c = 0; c < C; ++c) {
+    out[(n * C + c) * H * W + hw] = (float)in[(n * H * W + hw) * C + c];
+  }
+}
+
 }  // namespace
 
 HipEngine::HipEngine(int device_id) : device_id_(device_id) {}
@@ -115,13 +146,43 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   input_name_ = graph.input(0).name();
   output_name_ = graph.output(0).name();
 
-  // Read all initializers (fp16 raw data).
+  // Read all initializers into raw bytes (float or half storage).
+  // NOTE: small scalars (Clip bounds) are often stored in float_data(),
+  // not raw_data() — materialize those too.
   for (int ii = 0; ii < graph.initializer_size(); ++ii) {
     const auto& init = graph.initializer(ii);
     auto& ws = weights_[init.name()];
     const std::string& raw = init.raw_data();
     ws.data.assign(raw.begin(), raw.end());
     ws.dtype = init.data_type();
+    if (ws.data.empty()) {
+      if (init.float_data_size() > 0) {
+        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+        ws.data.resize(init.float_data_size() * 4);
+        std::memcpy(ws.data.data(), init.float_data().data(), ws.data.size());
+      } else if (init.double_data_size() > 0) {
+        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+        ws.data.resize(init.double_data_size() * 4);
+        for (int k = 0; k < init.double_data_size(); ++k) {
+          float v = static_cast<float>(init.double_data(k));
+          std::memcpy(ws.data.data() + k * 4, &v, 4);
+        }
+      } else if (init.int32_data_size() > 0) {
+        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+        ws.data.resize(init.int32_data_size() * 4);
+        for (int k = 0; k < init.int32_data_size(); ++k) {
+          float v = static_cast<float>(init.int32_data(k));
+          std::memcpy(ws.data.data() + k * 4, &v, 4);
+        }
+      } else if (init.int64_data_size() > 0) {
+        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+        ws.data.resize(init.int64_data_size() * 4);
+        for (int k = 0; k < init.int64_data_size(); ++k) {
+          float v = static_cast<float>(init.int64_data(k));
+          std::memcpy(ws.data.data() + k * 4, &v, 4);
+        }
+      }
+    }
     for (int d = 0; d < init.dims_size(); ++d) {
       ws.shape.push_back(init.dims(d));
     }
@@ -187,6 +248,14 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   // Skip the boundary Cast nodes. Detection and consumption must happen in
   // ONE pass: input_name_/output_name_ are rewritten during detection, so a
   // later name-based pass would miss the converter-inserted casts.
+  // Models whose IO is natively fp32 (no Cast nodes) still need the fp32
+  // bridge paths — detect bare fp32 IO directly.
+  if (graph.input(0).type().tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    input_is_fp32_ = true;
+  }
+  if (graph.output(0).type().tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    output_is_fp32_ = true;
+  }
   std::vector<bool> consumed(graph.node_size(), false);
   if (graph.input(0).type().tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
     for (int ni = 0; ni < graph.node_size(); ++ni) {
@@ -861,13 +930,20 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     std::memcpy(input_staging_f32_, input_data, input_ort_bytes_);
     hipMemcpyAsync(input_f32_dev_, input_staging_f32_, input_ort_bytes_,
                    hipMemcpyHostToDevice, stream);
-    // Elementwise fp32->fp16 cast (plugin pack order == buffer order).
-    hipLaunchKernelGGL(cast_f32_to_f16,
-                       dim3(DivCeil(static_cast<uint64_t>(input_bytes_ / 2), 256u)),
-                       dim3(256), 0, stream,
-                       static_cast<const float*>(input_f32_dev_),
-                       static_cast<_Float16*>(buffers_[input_buffer_].ptr),
-                       static_cast<uint32_t>(input_bytes_ / 2));
+    // NCHW upload -> NHWC compute buffer: fused transpose + cast.
+    // (built_input_shape_ is NCHW; C=1 makes this a plain cast.)
+    {
+      const uint32_t iN = static_cast<uint32_t>(built_input_shape_[0]);
+      const uint32_t iC = static_cast<uint32_t>(built_input_shape_[1]);
+      const uint32_t iH = static_cast<uint32_t>(built_input_shape_[2]);
+      const uint32_t iW = static_cast<uint32_t>(built_input_shape_[3]);
+      hipLaunchKernelGGL(cast_f32_to_f16_transpose,
+                         dim3(DivCeil(static_cast<uint64_t>(iN) * iH * iW, 256u)),
+                         dim3(256), 0, stream,
+                         static_cast<const float*>(input_f32_dev_),
+                         static_cast<_Float16*>(buffers_[input_buffer_].ptr),
+                         iN, iC, iH, iW);
+    }
     {
       static const bool dbg = [] { const char* e = std::getenv("VSHIP_DEBUG"); return e && *e == '1'; }();
       if (dbg && !input_is_fp32_dbg_done_) {
@@ -959,14 +1035,22 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
 
   if (output_is_fp32_) {
     // fp16 compute, fp32 download: cast on-device (unless the final DTS
-    // already wrote floats), then download floats.
+    // already wrote floats), then download floats. NHWC compute buffer ->
+    // NCHW download: fused transpose + cast (C=1 is a plain cast).
     if (!dts_fused_fp32) {
-      hipLaunchKernelGGL(cast_f16_to_f32,
-                         dim3(DivCeil(static_cast<uint64_t>(output_bytes_ / 2), 256u)),
+      std::unordered_map<std::string, std::vector<int64_t>> oshapes;
+      PropagateShapes(built_input_shape_, oshapes);
+      const std::vector<int64_t>& onhwc = oshapes[output_name_];  // N,H,W,C
+      const uint32_t oN = static_cast<uint32_t>(onhwc[0]);
+      const uint32_t oH = static_cast<uint32_t>(onhwc[1]);
+      const uint32_t oW = static_cast<uint32_t>(onhwc[2]);
+      const uint32_t oC = static_cast<uint32_t>(onhwc[3]);
+      hipLaunchKernelGGL(cast_f16_to_f32_transpose,
+                         dim3(DivCeil(static_cast<uint64_t>(oN) * oH * oW, 256u)),
                          dim3(256), 0, stream,
                          static_cast<const _Float16*>(buffers_[output_buffer_].ptr),
                          static_cast<float*>(output_f32_dev_),
-                         static_cast<uint32_t>(output_bytes_ / 2));
+                         oN, oC, oH, oW);
     }
     hipMemcpyAsync(output_staging_f32_, output_f32_dev_, output_ort_bytes_,
                    hipMemcpyDeviceToHost, stream);

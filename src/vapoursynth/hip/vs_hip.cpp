@@ -162,15 +162,18 @@ static const VSFrameRef* VS_CC hipGetFrame(
               dst_row[x * in_c + c] = row[x];
             }
         }
-      } else if (host_fp32) {  // fp32 raw pass-through (engine converts host-side)
-        for (int y = 0; y < in_h; ++y) {
-          auto* dst_row = reinterpret_cast<float*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w * in_c;
-          for (int x = 0; x < in_w; ++x)
-            for (int c = 0; c < in_c; ++c) {
-              const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
-              dst_row[x * in_c + c] = row[x];
-            }
+      } else if (host_fp32) {
+        // fp32 raw pass-through in ORT NCHW order (plane-major): the engine
+        // uploads + casts into its NCHW fp32 mirror, then transposes to the
+        // NHWC compute buffer on-device. (C=1: identical to interleaved.)
+        for (int c = 0; c < in_c; ++c) {
+          float* dst_plane = reinterpret_cast<float*>(in_pack.data()) +
+                             static_cast<size_t>(c) * in_h * in_w;
+          for (int y = 0; y < in_h; ++y) {
+            const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
+            std::memcpy(dst_plane + static_cast<size_t>(y) * in_w, row,
+                        static_cast<size_t>(in_w) * 4);
+          }
         }
       } else {  // fp32 source into an fp16-input model: precision convert
         for (int y = 0; y < in_h; ++y) {

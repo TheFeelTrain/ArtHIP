@@ -106,9 +106,12 @@ FAILED / REVERTED (do not blind-retry):
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
 - Why did vs_ab_check segfault intermittently at teardown in 4-backend
   same-process runs (migx+vulkan+hip loaded together)? HIP-only runs are
-  stable. Suspect cross-runtime (ROCm+RADV) teardown ordering; not a
-  plugin blocker but makes scripted validation flaky — prefer per-backend
-  processes for automated checks.
+  stable. STILL OPEN 2026-09-06: plain `python -c` HIP-then-MIGX
+  ArtCNN.R8F64 same-process run segfaults in teardown AFTER printing both
+  correct accuracy lines (luma maxdiff 0.00571 printed fine); per-backend
+  processes are the workaround. Suspect cross-runtime (ROCm+RADV) teardown
+  ordering; not a plugin blocker but makes scripted validation flaky — prefer
+  per-backend processes for automated checks.
 
 # HIP NOTES - standalone HIP plugin + HIP execution provider
 
@@ -298,10 +301,43 @@ NEXT (not tried, in priority order):
 
 ## Multi-channel models (2026-09-06, chroma R8F64 WIP — NOT SHIPPED)
 
-Goal: run ArtCNN_R8F64_Chroma (3ch in → 2ch out, fp32-IO, YUV444) on Backend.HIP.
-Status: pipeline runs end-to-end (flexible protocol works, frames flow, no
-crash) but U/V outputs are UNCORRELATED with MIGX (corr ~0, 87% px >0.02;
-means match coincidentally). Luma path unaffected (maxdiff 0.00571).
+RESOLVED 2026-09-06: chroma was NEVER broken in the engine. HIP-vs-MIGX via
+vsscale on identical random YUV444PS: 64x64 (U maxdiff 0.005/V 0.008),
+320x180 (U 0.0095/V 0.0088, 0% px >0.02), 1080p random (U 0.0117/V 0.0112,
+0% px >0.02) — fp16-rounding class plus tail-Clip saturation divergence,
+same class as luma (0.0057). Luma unaffected (320p maxdiff 0.00571,
+EP multires 256: HIP-vs-CPU 0.00098 = MIGX-vs-CPU 0.00098).
+Root causes of the false alarm, in order:
+1. STALE PLUGIN BINARY: /usr/lib/.../plugins/libhip.so (04:50) predated the
+   working tree's transpose fix — always rebuild+reinstall before concluding
+   (cd src/vapoursynth && ./build_hip.sh && cp ...). After reinstall, VS-vs-EP
+   on the identical constant-0.3 tensor matches to 1e-5 (ladder step 2 PASSES).
+2. BROKEN TEST HARNESSES, not the engine:
+   - chroma_vspack.py fed a RAW constant-0.3 tensor through the VS plugin,
+     skipping vsscale's preprocess (Y clamp, UV x0.5+0.5); raw Blanks are
+     Y=0/U=0/V=0 (NOT 0/0.5/0.5), BlankClip YUV444PS reads back garbage float
+     bit patterns (~-3.7e19) without ctypes per-plane reads. And the "EP" half
+     ran through the HIP ORT EP .so which no longer registers on this box
+     (falls back to CPU with a warning) — so it compared garbage-VS vs CPU-EP.
+   - chroma_acc.py's read idiom (ctypes.cast(get_read_ptr)) is only safe for
+     tightly-packed frames; with stride padding it segfaults in numpy — use
+     acc_dump.py's idiom only when stride == w*bytes, else row-copy via
+     ptr.value + get_stride(0). The migx-after-hip same-process teardown
+     segfault (OPEN QUESTION below) also poisoned several runs.
+   - Correct harness: vsscale ArtCNN.R8F64_Chroma both backends on the SAME
+     ModifyFrame clip (tmp/chroma_acc.py fixed idiom), stride-aware reads,
+     per-backend processes.
+3. The ACTUAL historical bug (already fixed in tree, 04:50): NCHW-vs-NHWC
+   transpose missing on the fp32 bridge paths. Shipped fix: plugin packs
+   NCHW plane-major + cast_f32_to_f16_transpose upload; NHWC->NCHW via
+   cast_f16_to_f32_transpose download. C=1 identical (no-op), C=3 fixed.
+   (tmp/chroma_vspack.py constant-0.3 VS-vs-EP ladder: VS means ~1e-28/1e-40/
+   1e-13 vs EP 0.30 was the pre-fix signature. plus the fp16/fp32 Clip-bound
+   misread fixed earlier: chroma stores float bounds, half-reads gave
+   clip max=1.9e-3 clamping all output to ~0.)
+Lesson: distrust any chroma number not produced by (a) freshly installed
+libhip.so (check timestamps), (b) vsscale preprocess on both sides, (c) the
+same random clip, (d) separate processes per backend.
 
 Shipped (working, keep):
 + flexible_output_prop protocol (matches vsmigx): Model returns MAP
@@ -314,24 +350,11 @@ Shipped (working, keep):
 + fp32 weight/clip-bound reads dtype-aware (WeightFloat/clip_scalar):
   chroma stores float initializers; half-reads gave clip max=1.9e-3 (~all
   output clamped to 0). Fixed that stage (output went 0 → full-range garbage).
++ fp32 bridge transpose (THIS SESSION): NCHW plane-major pack in vs_hip.cpp
+  (host_fp32 branch) + cast_f32_to_f16_transpose upload +
+  cast_f16_to_f32_transpose download in hip_engine.cc. C=1 path unchanged.
 
-Root-caused (incomplete — the actual bug):
-- The VS plugin greets the engine in NCHW (in_shape {1,3,H,W}) but packs
-  pixel-interleaved NHWC bytes. The fp32 upload cast is ELEMENTWISE, so the
-  NCHW→NHWC transpose NEVER HAPPENS: channels are permuted garbage into
-  conv0 (constant-0.3 input reproduces: VS means ~1e-28/1e-40/1e-13 vs EP
-  0.30 on the identical tensor). Same story on output: device NHWC → host
-  memcpy'd as NCHW. Single-channel models are immune (C=1: transpose = copy).
-- Fix direction: transpose at the boundaries. Input: NCHW pack (plane-major)
-  + fused NCHW→NHWC cast kernel (tried — output stayed garbage because the
-  OUTPUT side was still wrong), or NHWC pack + NCHW-aware addressing (wrong
-  layer). Output: NHWC→NCHW in the download cast. Both sides were attempted separately and reverted in confusion; do BOTH at once, then compare
-  vs the EP (tmp/chroma_vspack.py: VS-vs-EP on identical tensor, must match
-  to 1e-5) BEFORE comparing vs MIGX (preprocess differs).
-- Clean test ladder: (1) EP-vs-EP done (bit-exact, both planes) — engine is
-  fine; (2) VS-vs-EP on identical tensor (FAILS now — the bug); (3) VS-vs-MIGX
-  last (needs identical preprocess: Y clamp, UV x0.5+0.5).
-- GOTCHAS logged: /tmp is per-command tmpfs (backups vanish — use tmp/);
+GOTCHAS logged: /tmp is per-command tmpfs (backups vanish — use tmp/);
   `git checkout -- <file>` nukes ALL uncommitted work in it (lost the plugin
   recovery twice — commit or `git diff > tmp/` first); heat-soak skews benches.
 
