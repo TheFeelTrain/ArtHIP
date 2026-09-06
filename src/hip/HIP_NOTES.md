@@ -140,11 +140,13 @@ Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
 - Run: `MANGOHUD=0 VS_BACKEND=hip vspipe -p tests/vs_test.py --`
   (tests/vs_test.py already routes `hip` to Backend.HIP).
 
-## Speed session (2026-09-06) - HIP 19.3-19.6 vs MIGX 15.5-15.6 (+25%)
+## Speed session (2026-09-06) - HIP 19.4 vs MIGX 15.5 (+25%, cooled pair)
 
-Paired 500f (migx-first order, 2026-09-06): HIP 19.43 vs MIGX 15.55 (+25%).
+Paired 500f after cooldown (2026-09-06): HIP 19.44 vs MIGX 15.49 (+25%).
 Photo accuracy vs MIGX unchanged
 (max 0.0057, 0% pixels >0.02). At/above the RTX 3080 TensorRT target band.
+BENCH HYGIENE: back-to-back runs heat-soak the card (MIGX 13.5, HIP 16.6 when
+hot); always cooldown + pair before quoting numbers.
 
 Target: RTX 3080 TensorRT does 18-19 fps on this model (similar on-paper fp16
 TFLOPS to the 7900 XTX), so headroom should exist. Method: rocprofv3 kernel
@@ -293,6 +295,45 @@ NEXT (not tried, in priority order):
    (CUTLASS-style, kills the Winograd transform + LDS traffic entirely).
 4. Lock clocks for benchmarking (rocm-smi --setperflevel high); all numbers
    above at sustained 2245MHz but the card idles at 130MHz between runs.
+
+## Multi-channel models (2026-09-06, chroma R8F64 WIP — NOT SHIPPED)
+
+Goal: run ArtCNN_R8F64_Chroma (3ch in → 2ch out, fp32-IO, YUV444) on Backend.HIP.
+Status: pipeline runs end-to-end (flexible protocol works, frames flow, no
+crash) but U/V outputs are UNCORRELATED with MIGX (corr ~0, 87% px >0.02;
+means match coincidentally). Luma path unaffected (maxdiff 0.00571).
+
+Shipped (working, keep):
++ flexible_output_prop protocol (matches vsmigx): Model returns MAP
+  {clip, num_planes} when the arg is passed; frames carry MlrtFlexibleN
+  FRAME props (PropToClip needs frames, not bytes — data props fail) +
+  num_planes. Verified: chroma vspipe runs, u/v split works.
++ Multi-channel pack: NCHW in_shape (clip planes or model C), NHWC
+  pixel-interleaved pack, NCHW out buffers, Input/OutputChannels() from
+  weight shapes, YUV clip acceptance.
++ fp32 weight/clip-bound reads dtype-aware (WeightFloat/clip_scalar):
+  chroma stores float initializers; half-reads gave clip max=1.9e-3 (~all
+  output clamped to 0). Fixed that stage (output went 0 → full-range garbage).
+
+Root-caused (incomplete — the actual bug):
+- The VS plugin greets the engine in NCHW (in_shape {1,3,H,W}) but packs
+  pixel-interleaved NHWC bytes. The fp32 upload cast is ELEMENTWISE, so the
+  NCHW→NHWC transpose NEVER HAPPENS: channels are permuted garbage into
+  conv0 (constant-0.3 input reproduces: VS means ~1e-28/1e-40/1e-13 vs EP
+  0.30 on the identical tensor). Same story on output: device NHWC → host
+  memcpy'd as NCHW. Single-channel models are immune (C=1: transpose = copy).
+- Fix direction: transpose at the boundaries. Input: NCHW pack (plane-major)
+  + fused NCHW→NHWC cast kernel (tried — output stayed garbage because the
+  OUTPUT side was still wrong), or NHWC pack + NCHW-aware addressing (wrong
+  layer). Output: NHWC→NCHW in the download cast. Both sides were attempted separately and reverted in confusion; do BOTH at once, then compare
+  vs the EP (tmp/chroma_vspack.py: VS-vs-EP on identical tensor, must match
+  to 1e-5) BEFORE comparing vs MIGX (preprocess differs).
+- Clean test ladder: (1) EP-vs-EP done (bit-exact, both planes) — engine is
+  fine; (2) VS-vs-EP on identical tensor (FAILS now — the bug); (3) VS-vs-MIGX
+  last (needs identical preprocess: Y clamp, UV x0.5+0.5).
+- GOTCHAS logged: /tmp is per-command tmpfs (backups vanish — use tmp/);
+  `git checkout -- <file>` nukes ALL uncommitted work in it (lost the plugin
+  recovery twice — commit or `git diff > tmp/` first); heat-soak skews benches.
 
 ## Output format (2026-09-06)
 

@@ -54,6 +54,7 @@ struct OpSpec {
 struct WeightSpec {
   std::vector<uint8_t> data;
   std::vector<int64_t> shape;
+  int dtype = 0;  // ONNX TensorProto data type (1=float, 10=half, ...)
 };
 
 struct TensorInfo {
@@ -103,6 +104,8 @@ class HipEngine {
   // Host-side helpers for the plugin's frame conversion.
   static bool FloatToHalfBitsRNE(float f, uint16_t& h);
   static float HalfBitsToFloat(uint16_t h);
+  // Weight element as float (fp32 or fp16 initializer storage).
+  static float WeightFloat(const std::vector<uint8_t>& data, int dtype, size_t idx);
 
   size_t InputBytes(const std::vector<int64_t>& input_shape) const;
   size_t OutputBytes(const std::vector<int64_t>& input_shape) const;
@@ -114,6 +117,11 @@ class HipEngine {
   // True when the model produces an fp32 output (internal compute is still
   // fp16; Run() converts on-device and returns raw fp32 host data).
   bool OutputIsFp32() const { return output_is_fp32_; }
+
+  // Model IO channels from the weight shapes (graph IO dims are dynamic):
+  // first-conv C (input) and tail-conv M (output). Valid after Build().
+  int InputChannels() const;
+  int OutputChannels() const;
 
  private:
   bool PropagateShapes(const std::vector<int64_t>& input_shape,

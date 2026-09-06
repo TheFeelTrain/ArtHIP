@@ -48,6 +48,9 @@ struct HipData {
   int num_streams = 1;
   bool output_fp16 = true;
   bool output_fp32 = false;  // fp16 compute, fp32 (GRAYS) output like MIGX
+  int input_channels = 1;
+  int output_channels = 1;
+  std::string flexible_prop;
   const VSVideoInfo* vi = nullptr;
   VSNodeRef* node = nullptr;
 };
@@ -86,7 +89,8 @@ static const VSFrameRef* VS_CC hipGetFrame(
   vship::HipEngine* eng =
       d->engines[d->next_engine.fetch_add(1) % static_cast<int>(d->engines.size())];
 
-  std::vector<int64_t> in_shape{1, 1, in_h, in_w};
+  const int in_c = (fmt->numPlanes > 1) ? fmt->numPlanes : d->input_channels;
+  std::vector<int64_t> in_shape{1, in_c, in_h, in_w};
   std::vector<int64_t> out_shape;
   if (!eng->GetOutputShape(in_shape, out_shape) || out_shape.size() != 4) {
     vsapi->setFilterError(vs_error("shape propagation failed").c_str(), frameCtx);
@@ -95,6 +99,7 @@ static const VSFrameRef* VS_CC hipGetFrame(
   }
   const int out_w = static_cast<int>(out_shape[3]);
   const int out_h = static_cast<int>(out_shape[2]);
+  const int out_c = static_cast<int>(out_shape[1]);
 
   const VSFormat* out_fmt = d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
                                 : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
@@ -105,36 +110,43 @@ static const VSFrameRef* VS_CC hipGetFrame(
   // fp32-input models pass through raw; everything else becomes fp16 [0,1].
   const bool host_fp32 = eng->InputIsFp32();
   const size_t in_elem = host_fp32 ? 4 : 2;
-  std::vector<uint8_t> in_pack(static_cast<size_t>(in_w) * in_h * in_elem);
+  std::vector<uint8_t> in_pack(static_cast<size_t>(in_w) * in_h * in_c * in_elem);
 
-  const uint8_t* src_ptr = vsapi->getReadPtr(src, 0);
-  const ptrdiff_t src_stride = vsapi->getStride(src, 0);
+  const uint8_t* src_ptrs[3] = {nullptr, nullptr, nullptr};
+  ptrdiff_t src_strides[3] = {0, 0, 0};
+  for (int p = 0; p < in_c && p < 3; ++p) {
+    const int pi = (fmt->numPlanes > 1) ? p : 0;
+    src_ptrs[p] = vsapi->getReadPtr(src, pi);
+    src_strides[p] = vsapi->getStride(src, pi);
+  }
   switch (fmt->sampleType) {
     case stInteger: {
       // Rare path (GRAY8/16 sources): scale + RNE convert to fp16.
       if (fmt->bitsPerSample == 8) {
         const float scale = 1.0f / 255.0f;
         for (int y = 0; y < in_h; ++y) {
-          const uint8_t* row = src_ptr + y * src_stride;
           auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w;
-          for (int x = 0; x < in_w; ++x) {
-            uint16_t h;
-            vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
-            dst_row[x] = h;
-          }
+                          static_cast<size_t>(y) * in_w * in_c;
+          for (int x = 0; x < in_w; ++x)
+            for (int c = 0; c < in_c; ++c) {
+              const uint8_t* row = src_ptrs[c] + y * src_strides[c];
+              uint16_t h;
+              vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
+              dst_row[x * in_c + c] = h;
+            }
         }
       } else {
         const float scale = 1.0f / 65535.0f;
         for (int y = 0; y < in_h; ++y) {
-          const uint16_t* row = reinterpret_cast<const uint16_t*>(src_ptr + y * src_stride);
           auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w;
-          for (int x = 0; x < in_w; ++x) {
-            uint16_t h;
-            vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
-            dst_row[x] = h;
-          }
+                          static_cast<size_t>(y) * in_w * in_c;
+          for (int x = 0; x < in_w; ++x)
+            for (int c = 0; c < in_c; ++c) {
+              const uint16_t* row = reinterpret_cast<const uint16_t*>(src_ptrs[c] + y * src_strides[c]);
+              uint16_t h;
+              vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
+              dst_row[x * in_c + c] = h;
+            }
         }
       }
       break;
@@ -142,24 +154,35 @@ static const VSFrameRef* VS_CC hipGetFrame(
     case stFloat: {
       if (fmt->bitsPerSample == 16) {  // fp16, already [0,1]
         for (int y = 0; y < in_h; ++y) {
-          std::memcpy(in_pack.data() + static_cast<size_t>(y) * in_w * in_elem,
-                      src_ptr + y * src_stride, static_cast<size_t>(in_w) * 2);
+          auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
+                          static_cast<size_t>(y) * in_w * in_c;
+          for (int x = 0; x < in_w; ++x)
+            for (int c = 0; c < in_c; ++c) {
+              const uint16_t* row = reinterpret_cast<const uint16_t*>(src_ptrs[c] + y * src_strides[c]);
+              dst_row[x * in_c + c] = row[x];
+            }
         }
       } else if (host_fp32) {  // fp32 raw pass-through (engine converts host-side)
         for (int y = 0; y < in_h; ++y) {
-          std::memcpy(in_pack.data() + static_cast<size_t>(y) * in_w * in_elem,
-                      src_ptr + y * src_stride, static_cast<size_t>(in_w) * 4);
+          auto* dst_row = reinterpret_cast<float*>(in_pack.data()) +
+                          static_cast<size_t>(y) * in_w * in_c;
+          for (int x = 0; x < in_w; ++x)
+            for (int c = 0; c < in_c; ++c) {
+              const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
+              dst_row[x * in_c + c] = row[x];
+            }
         }
       } else {  // fp32 source into an fp16-input model: precision convert
         for (int y = 0; y < in_h; ++y) {
-          const float* row = reinterpret_cast<const float*>(src_ptr + y * src_stride);
           auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w;
-          for (int x = 0; x < in_w; ++x) {
-            uint16_t h;
-            vship::HipEngine::FloatToHalfBitsRNE(row[x], h);
-            dst_row[x] = h;
-          }
+                          static_cast<size_t>(y) * in_w * in_c;
+          for (int x = 0; x < in_w; ++x)
+            for (int c = 0; c < in_c; ++c) {
+              const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
+              uint16_t h;
+              vship::HipEngine::FloatToHalfBitsRNE(row[x], h);
+              dst_row[x * in_c + c] = h;
+            }
         }
       }
       break;
@@ -172,10 +195,10 @@ static const VSFrameRef* VS_CC hipGetFrame(
   std::vector<uint16_t> out_fp16;
   void* out_ptr = nullptr;
   if (d->output_fp32) {
-    out_f32.resize(static_cast<size_t>(out_w) * out_h);
+    out_f32.resize(static_cast<size_t>(out_w) * out_h * out_c);
     out_ptr = out_f32.data();
   } else {
-    out_fp16.resize(static_cast<size_t>(out_w) * out_h);
+    out_fp16.resize(static_cast<size_t>(out_w) * out_h * out_c);
     out_ptr = out_fp16.data();
   }
   static const bool dbg = [] { const char* e = std::getenv("VSHIP_TRACE"); return e && *e == '1'; }();
@@ -193,7 +216,12 @@ static const VSFrameRef* VS_CC hipGetFrame(
     return nullptr;
   }
 
-  // Write the output to the destination frame (fp16 [0,1] or fp32).
+  // Writeback: plane 0 to the frame; with flexible_output_prop, planes
+  // 0..C-1 also stashed as MlrtFlexibleN frame props (+ num_planes), matching
+  // the vsmigx flexible protocol for PropToClip splitting.
+  const bool want_map = !d->flexible_prop.empty();
+  const bool flex = want_map && out_c > 1;
+  const size_t plane_px = static_cast<size_t>(out_w) * out_h;
   uint8_t* dst_ptr = vsapi->getWritePtr(dst, 0);
   const ptrdiff_t dst_stride = vsapi->getStride(dst, 0);
   if (d->output_fp32) {
@@ -201,10 +229,58 @@ static const VSFrameRef* VS_CC hipGetFrame(
       float* row = reinterpret_cast<float*>(dst_ptr + y * dst_stride);
       std::memcpy(row, &out_f32[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 4);
     }
+    if (want_map) {
+      VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      uint8_t* p0ptr = vsapi->getWritePtr(p0, 0);
+      const ptrdiff_t p0stride = vsapi->getStride(p0, 0);
+      for (int y = 0; y < out_h; ++y) {
+        float* row = reinterpret_cast<float*>(p0ptr + y * p0stride);
+        std::memcpy(row, &out_f32[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 4);
+      }
+      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + "0").c_str(), p0, paReplace);
+      vsapi->freeFrame(p0);
+      vsapi->propSetInt(vsapi->getFramePropsRW(dst), "num_planes", out_c, paReplace);
+    }
+    for (int c = 1; flex && c < out_c; ++c) {
+      VSFrameRef* pf = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      uint8_t* pptr = vsapi->getWritePtr(pf, 0);
+      const ptrdiff_t pstride = vsapi->getStride(pf, 0);
+      for (int y = 0; y < out_h; ++y) {
+        float* row = reinterpret_cast<float*>(pptr + y * pstride);
+        std::memcpy(row, &out_f32[static_cast<size_t>(c) * plane_px + static_cast<size_t>(y) * out_w],
+                    static_cast<size_t>(out_w) * 4);
+      }
+      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, paReplace);
+      vsapi->freeFrame(pf);
+    }
   } else if (d->output_fp16) {
     for (int y = 0; y < out_h; ++y) {
       uint16_t* row = reinterpret_cast<uint16_t*>(dst_ptr + y * dst_stride);
       std::memcpy(row, &out_fp16[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 2);
+    }
+    if (want_map) {
+      VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      uint8_t* p0ptr = vsapi->getWritePtr(p0, 0);
+      const ptrdiff_t p0stride = vsapi->getStride(p0, 0);
+      for (int y = 0; y < out_h; ++y) {
+        uint16_t* row = reinterpret_cast<uint16_t*>(p0ptr + y * p0stride);
+        std::memcpy(row, &out_fp16[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 2);
+      }
+      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + "0").c_str(), p0, paReplace);
+      vsapi->freeFrame(p0);
+      vsapi->propSetInt(vsapi->getFramePropsRW(dst), "num_planes", out_c, paReplace);
+    }
+    for (int c = 1; flex && c < out_c; ++c) {
+      VSFrameRef* pf = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      uint8_t* pptr = vsapi->getWritePtr(pf, 0);
+      const ptrdiff_t pstride = vsapi->getStride(pf, 0);
+      for (int y = 0; y < out_h; ++y) {
+        uint16_t* row = reinterpret_cast<uint16_t*>(pptr + y * pstride);
+        std::memcpy(row, &out_fp16[static_cast<size_t>(c) * plane_px + static_cast<size_t>(y) * out_w],
+                    static_cast<size_t>(out_w) * 2);
+      }
+      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, paReplace);
+      vsapi->freeFrame(pf);
     }
   } else {
     for (int y = 0; y < out_h; ++y) {
@@ -295,6 +371,18 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
     d->engines.push_back(e);
   }
   d->output_fp32 = !d->engines.empty() && d->engines[0]->OutputIsFp32();
+  if (!d->engines.empty()) {
+    d->input_channels = d->engines[0]->InputChannels();
+    d->output_channels = d->engines[0]->OutputChannels();
+    if (d->input_channels < 1) d->input_channels = 1;
+    if (d->output_channels < 1) d->output_channels = 1;
+  }
+  probe_in[1] = d->input_channels;
+  if (!d->engines.empty() &&
+      (!d->engines[0]->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4)) {
+    set_error("model shape probe failed");
+    return;
+  }
 
   const int in_w = d->vi->width;
   const int in_h = d->vi->height;
@@ -341,22 +429,48 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
   auto* d = new HipData;
   d->node = vsapi->propGetNode(in, "clips", 0, nullptr);
   d->vi = vsapi->getVideoInfo(d->node);
+  int ferr = 0;
+  if (vsapi->propNumElements(in, "flexible_output_prop") > 0) {
+    const char* fp = vsapi->propGetData(in, "flexible_output_prop", 0, &ferr);
+    if (fp) d->flexible_prop = fp;
+  }
 
-  // Validate the clip format: single-plane 8/16-bit int or fp32/fp16 float.
+  // 8/16-bit int or fp16/fp32 float, gray or YUV (multi-plane clips feed
+  // multi-channel models, e.g. chroma ArtCNN).
   const auto* fmt = d->vi->format;
-  if (!fmt || fmt->numPlanes != 1 || fmt->colorFamily != cmGray) {
-    set_error("expects a single-plane gray clip");
+  if (!fmt || (fmt->colorFamily != cmGray && fmt->colorFamily != cmYUV)) {
+    set_error("expects a gray or YUV clip");
     delete d;
     return;
   }
   if (!((fmt->sampleType == stInteger && (fmt->bitsPerSample == 8 || fmt->bitsPerSample == 16)) ||
         (fmt->sampleType == stFloat && (fmt->bitsPerSample == 16 || fmt->bitsPerSample == 32)))) {
-    set_error("expects GRAY8/GRAY16/GRAYH/GRAYS input");
+    set_error("expects 8/16-bit int or fp16/fp32 float input");
     delete d;
     return;
   }
 
-  vsapi->createFilter(in, out, "Model", hipInit, hipGetFrame, hipFree, fmParallel, 0, d, core);
+  // Flexible protocol (matches vsmigx): Model returns MAP {clip, num_planes}.
+  bool flex = !d->flexible_prop.empty();
+  VSMap* dst_map = flex ? vsapi->createMap() : out;
+  vsapi->createFilter(in, dst_map, "Model", hipInit, hipGetFrame, hipFree, fmParallel, 0, d, core);
+  if (flex) {
+    if (vsapi->propNumElements(dst_map, "clip") == 0) {
+      vsapi->freeMap(dst_map);
+      return;
+    }
+    int err2 = 0;
+    VSNodeRef* node = vsapi->propGetNode(dst_map, "clip", 0, &err2);
+    vsapi->freeMap(dst_map);
+    if (!node || err2) {
+      set_error("flexible mode: filter node lookup failed");
+      delete d;
+      return;
+    }
+    vsapi->propSetNode(out, "clip", node, paReplace);
+    vsapi->propSetInt(out, "num_planes", d->output_channels > 0 ? d->output_channels : 1, paReplace);
+    vsapi->freeNode(node);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +519,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc,
                "tilesize:int[]:opt;"
                "device_id:int:opt;"
                "num_streams:int:opt;"
-               "fp16:int:opt;",
+               "fp16:int:opt;"
+               "flexible_output_prop:data:opt;",
                hipCreate, nullptr, plugin);
 
   registerFunc("Version", "", hipVersion, nullptr, plugin);

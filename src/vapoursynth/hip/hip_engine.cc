@@ -121,6 +121,7 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
     auto& ws = weights_[init.name()];
     const std::string& raw = init.raw_data();
     ws.data.assign(raw.begin(), raw.end());
+    ws.dtype = init.data_type();
     for (int d = 0; d < init.dims_size(); ++d) {
       ws.shape.push_back(init.dims(d));
     }
@@ -153,6 +154,23 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
 
   // fp32 model I/O detection (with converter-inserted boundary casts) happens
   // further down, in the same pass that marks the Cast nodes consumed.
+
+  // Clip-bound scalar: fp32 (float) or fp16 (half) initializer -> float.
+  // (The fp16 luma model stores half bounds; the fp32 chroma model stores
+  // float bounds. Reading float bits as half gave min=-0.0/max=1.9e-3,
+  // clamping all chroma output to ~0.)
+  auto clip_scalar = [&](const std::string& name, float& dst) {
+    const auto w = weights_.find(name);
+    if (w == weights_.end() || w->second.data.size() < 2) return;
+    if (w->second.dtype == ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
+        w->second.data.size() >= 4) {
+      float v;
+      std::memcpy(&v, w->second.data.data(), 4);
+      dst = v;
+    } else {
+      dst = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(w->second.data.data()));
+    }
+  };
 
   auto read_initializer = [&](const std::string& name, std::vector<uint8_t>& data,
                               std::vector<int64_t>& dims) -> bool {
@@ -285,20 +303,8 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
       op.in0 = in_name(0);
       if (auto a = attr(n, "min")) op.clip_min = a->f();
       if (auto a = attr(n, "max")) op.clip_max = a->f();
-      if (n.input_size() > 1 && !n.input(1).empty()) {
-        std::vector<uint8_t> raw;
-        std::vector<int64_t> dims;
-        if (read_initializer(n.input(1), raw, dims) && raw.size() >= 2) {
-          op.clip_min = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(raw.data()));
-        }
-      }
-      if (n.input_size() > 2 && !n.input(2).empty()) {
-        std::vector<uint8_t> raw;
-        std::vector<int64_t> dims;
-        if (read_initializer(n.input(2), raw, dims) && raw.size() >= 2) {
-          op.clip_max = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(raw.data()));
-        }
-      }
+      if (n.input_size() > 1 && !n.input(1).empty()) clip_scalar(n.input(1), op.clip_min);
+      if (n.input_size() > 2 && !n.input(2).empty()) clip_scalar(n.input(2), op.clip_max);
     } else if (optype == "DepthToSpace") {
       op.type = OpType::DepthToSpace;
       op.in0 = in_name(0);
@@ -313,18 +319,8 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         if (cn.op_type() != "Clip" || consumed[ci]) continue;
         if (auto a = attr(cn, "min")) op.clip_min = a->f();
         if (auto a = attr(cn, "max")) op.clip_max = a->f();
-        if (cn.input_size() > 1 && !cn.input(1).empty()) {
-          std::vector<uint8_t> raw;
-          std::vector<int64_t> dims;
-          if (read_initializer(cn.input(1), raw, dims) && raw.size() >= 2)
-            op.clip_min = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(raw.data()));
-        }
-        if (cn.input_size() > 2 && !cn.input(2).empty()) {
-          std::vector<uint8_t> raw;
-          std::vector<int64_t> dims;
-          if (read_initializer(cn.input(2), raw, dims) && raw.size() >= 2)
-            op.clip_max = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(raw.data()));
-        }
+        if (cn.input_size() > 1 && !cn.input(1).empty()) clip_scalar(cn.input(1), op.clip_min);
+        if (cn.input_size() > 2 && !cn.input(2).empty()) clip_scalar(cn.input(2), op.clip_max);
         op.fuse_clip = true;
         consumed[ci] = true;
         op.out = cn.output(0);  // produce the Clip's output tensor directly
@@ -433,6 +429,28 @@ int64_t HipEngine::OutputElements(const std::vector<int64_t>& input_shape) {
   std::vector<int64_t> o;
   if (!GetOutputShape(input_shape, o)) return 0;
   return NumElements(o);
+}
+
+int HipEngine::InputChannels() const {
+  for (const auto& op : ops_) {
+    if (op.type != OpType::Conv) continue;
+    const auto it = weights_.find(op.in1);
+    if (it != weights_.end() && it->second.shape.size() >= 2) {
+      return static_cast<int>(it->second.shape[1]);
+    }
+  }
+  return 1;
+}
+
+int HipEngine::OutputChannels() const {
+  for (auto it = ops_.rbegin(); it != ops_.rend(); ++it) {
+    if (it->type != OpType::Conv) continue;
+    const auto w = weights_.find(it->in1);
+    if (w != weights_.end() && !w->second.shape.empty()) {
+      return static_cast<int>(w->second.shape[0]);
+    }
+  }
+  return 1;
 }
 
 size_t HipEngine::InputBytes(const std::vector<int64_t>& input_shape) const {
@@ -545,17 +563,17 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
           // Direct 3x3 kernel for the C=1 first conv: [t][c][co] + bias.
           const uint32_t wt_size = 9u * C * M + M;
           std::vector<uint16_t> d_buf(wt_size, 0);
-          const uint16_t* src = reinterpret_cast<const uint16_t*>(wspec.data.data());
           for (uint32_t t = 0; t < 9u; ++t)
             for (uint32_t c = 0; c < C; ++c)
               for (uint32_t ko = 0; ko < M; ++ko)
-                d_buf[(t * C + c) * M + ko] = src[static_cast<size_t>(ko) * C * 9u + c * 9u + t];
+                FloatToHalfBitsRNE(
+                    HipEngine::WeightFloat(wspec.data, wspec.dtype, static_cast<size_t>(ko) * C * 9u + c * 9u + t),
+                    d_buf[(t * C + c) * M + ko]);
           if (!op.conv_bias.empty() && weights_.count(op.conv_bias)) {
             const auto& bs = weights_[op.conv_bias];
-            const uint16_t* bsrc = reinterpret_cast<const uint16_t*>(bs.data.data());
             for (uint32_t ko = 0; ko < M; ++ko) {
               uint16_t uh;
-              FloatToHalfBitsRNE(HalfBitsToFloat(bsrc[ko]), uh);
+              FloatToHalfBitsRNE(HipEngine::WeightFloat(bs.data, bs.dtype, ko), uh);
               std::memcpy(d_buf.data() + 9u * C * M + ko, &uh, 2);
             }
           }
@@ -587,12 +605,11 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
                                {0.5f, -0.5f, 0.5f},
                                {0.0f, 0.0f, 1.0f}};
         std::vector<uint16_t> u_buf(kb_stride * 4u * C_blocks * 4u * 256u + M_pad, 0);
-        const uint16_t* src = reinterpret_cast<const uint16_t*>(wspec.data.data());
         for (uint32_t ko = 0; ko < M; ++ko) {
           for (uint32_t c = 0; c < C; ++c) {
             float g[9];
             for (uint32_t t = 0; t < 9; ++t) {
-              g[t] = HalfBitsToFloat(src[(static_cast<size_t>(ko) * C + c) * 9 + t]);
+              g[t] = HipEngine::WeightFloat(wspec.data, wspec.dtype, (static_cast<size_t>(ko) * C + c) * 9 + t);
             }
             float Gg[4][3];
             for (uint32_t r = 0; r < 4; ++r)
@@ -615,10 +632,9 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
         }
         if (!op.conv_bias.empty() && weights_.count(op.conv_bias)) {
           const auto& bs = weights_[op.conv_bias];
-          const uint16_t* bsrc = reinterpret_cast<const uint16_t*>(bs.data.data());
           for (uint32_t ko = 0; ko < M; ++ko) {
             uint16_t uh;
-            FloatToHalfBitsRNE(HalfBitsToFloat(bsrc[ko]), uh);
+            FloatToHalfBitsRNE(HipEngine::WeightFloat(bs.data, bs.dtype, ko), uh);
             std::memcpy(u_buf.data() + kb_stride * 4u * C_blocks * 4u * 256u + ko, &uh, 2);
           }
         }
@@ -701,7 +717,11 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
 
   input_bytes_ = static_cast<size_t>(NumElements(shapes[input_name_]) * 2);
   output_bytes_ = static_cast<size_t>(NumElements(shapes[output_name_]) * 2);
-  input_ort_bytes_ = input_bytes_ * (input_is_fp32_ ? 2 : 1);
+  // fp32 input staging is sized from the NCHW input shape (element count
+  // is layout-independent; the NHWC internal map holds the same count).
+  input_ort_bytes_ = input_is_fp32_
+                         ? static_cast<size_t>(NumElements(built_input_shape_)) * 4
+                         : 0;
   output_ort_bytes_ = output_bytes_ * (output_is_fp32_ ? 2 : 1);
 
   hipHostMalloc(&input_staging_, input_bytes_, hipHostMallocDefault);
@@ -787,6 +807,15 @@ bool HipEngine::FloatToHalfBitsRNE(float f, uint16_t& h) {
   return true;
 }
 
+float HipEngine::WeightFloat(const std::vector<uint8_t>& data, int dtype, size_t idx) {
+  if (dtype == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    float v;
+    std::memcpy(&v, data.data() + idx * 4, 4);
+    return v;
+  }
+  return HalfBitsToFloat(reinterpret_cast<const uint16_t*>(data.data())[idx]);
+}
+
 float HipEngine::HalfBitsToFloat(uint16_t h) {
   const uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16u;
   const uint32_t e = (h >> 10u) & 0x1fu;
@@ -832,6 +861,7 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     std::memcpy(input_staging_f32_, input_data, input_ort_bytes_);
     hipMemcpyAsync(input_f32_dev_, input_staging_f32_, input_ort_bytes_,
                    hipMemcpyHostToDevice, stream);
+    // Elementwise fp32->fp16 cast (plugin pack order == buffer order).
     hipLaunchKernelGGL(cast_f32_to_f16,
                        dim3(DivCeil(static_cast<uint64_t>(input_bytes_ / 2), 256u)),
                        dim3(256), 0, stream,
