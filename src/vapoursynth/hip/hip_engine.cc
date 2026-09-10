@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <unordered_set>
 
 #include "hip_kernels.h"
 
@@ -20,6 +21,93 @@ int64_t NumElements(const std::vector<int64_t>& shape) {
 
 uint32_t DivCeil(uint64_t a, uint32_t b) {
   return static_cast<uint32_t>((a + b - 1) / b);
+}
+
+// ONNX element size for the dtypes the engine can consume; 0 for unknown.
+size_t OnnxDtypeSize(int dtype) {
+  switch (dtype) {
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT: return 4;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16: return 2;
+    case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE: return 8;
+    case ONNX_NAMESPACE::TensorProto_DataType_INT64: return 8;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+    case ONNX_NAMESPACE::TensorProto_DataType_INT32: return 4;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT16:
+    case ONNX_NAMESPACE::TensorProto_DataType_INT16:
+    case ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16: return 2;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
+    case ONNX_NAMESPACE::TensorProto_DataType_INT8:
+    case ONNX_NAMESPACE::TensorProto_DataType_BOOL: return 1;
+    default: return 0;
+  }
+}
+
+// Materialize one initializer's storage with its declared dtype preserved.
+// FLOAT16 values are stored in int32_data() as 16-bit bit patterns (that is
+// what the ONNX schema and ArtHIP's own converter do), so they must NOT be
+// interpreted as numeric integers. External data cannot be materialized by
+// this parser and is rejected here.
+bool MaterializeInitializer(const ONNX_NAMESPACE::TensorProto& init,
+                            WeightSpec& ws, std::string& error) {
+  const std::string& name = init.name();
+  ws.dtype = init.data_type();
+  ws.data.clear();
+  ws.shape.clear();
+  for (int d = 0; d < init.dims_size(); ++d) ws.shape.push_back(init.dims(d));
+
+  if (init.data_location() == ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL) {
+    error = "initializer '" + name + "' uses external data, which is not supported";
+    return false;
+  }
+
+  const std::string& raw = init.raw_data();
+  if (!raw.empty()) {
+    if (OnnxDtypeSize(ws.dtype) == 0) {
+      error = "initializer '" + name + "' has an unsupported dtype";
+      return false;
+    }
+    ws.data.assign(raw.begin(), raw.end());
+    return true;
+  }
+
+  if (init.float_data_size() > 0) {
+    if (ws.dtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+      error = "initializer '" + name + "' has float_data with a non-FLOAT dtype";
+      return false;
+    }
+    ws.data.resize(static_cast<size_t>(init.float_data_size()) * 4);
+    std::memcpy(ws.data.data(), init.float_data().data(), ws.data.size());
+  } else if (init.double_data_size() > 0) {
+    if (ws.dtype != ONNX_NAMESPACE::TensorProto_DataType_DOUBLE) {
+      error = "initializer '" + name + "' has double_data with a non-DOUBLE dtype";
+      return false;
+    }
+    ws.data.resize(static_cast<size_t>(init.double_data_size()) * 8);
+    std::memcpy(ws.data.data(), init.double_data().data(), ws.data.size());
+  } else if (init.int32_data_size() > 0) {
+    // int8/int16/bool/int32/uint* and FLOAT16/BFLOAT16 all share int32_data as
+    // one slot per element. FLOAT16 slots hold 16-bit BIT PATTERNS, not numeric
+    // integers, so the declared element width governs: keep the low
+    // size-of-dtype bytes of each slot verbatim (little-endian host).
+    const int n = init.int32_data_size();
+    const size_t elem = OnnxDtypeSize(ws.dtype);
+    if (elem == 0) {
+      error = "initializer '" + name + "' has an unsupported dtype";
+      return false;
+    }
+    ws.data.resize(static_cast<size_t>(n) * elem);
+    for (int k = 0; k < n; ++k) {
+      const uint32_t v = static_cast<uint32_t>(init.int32_data(k));
+      std::memcpy(ws.data.data() + static_cast<size_t>(k) * elem, &v, elem);
+    }
+  } else if (init.int64_data_size() > 0) {
+    const int n = init.int64_data_size();
+    ws.data.resize(static_cast<size_t>(n) * 8);
+    std::memcpy(ws.data.data(), init.int64_data().data(), ws.data.size());
+  }
+  // An empty typed field is legal for a zero-element tensor; every consumer
+  // validates that the bytes it reads are present.
+  return true;
 }
 
 struct WinogradPush {
@@ -102,12 +190,17 @@ HipEngine::~HipEngine() {
 }
 
 void HipEngine::DestroyDeviceState() {
+  // Freeing device memory requires the owning device to be current on THIS
+  // thread; the destructor and rebuild paths can run on any thread.
+  hipSetDevice(device_id_);
   for (auto& buf : buffers_) {
     if (buf.ptr) hipFree(buf.ptr);
   }
   buffers_.clear();
   tensor_map_.clear();
   device_ops_.clear();
+  input_buffer_ = -1;
+  output_buffer_ = -1;
   if (input_staging_) {
     hipFreeHost(input_staging_);
     input_staging_ = nullptr;
@@ -146,46 +239,17 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   input_name_ = graph.input(0).name();
   output_name_ = graph.output(0).name();
 
-  // Read all initializers into raw bytes (float or half storage).
-  // NOTE: small scalars (Clip bounds) are often stored in float_data(),
-  // not raw_data() — materialize those too.
+  // Read all initializers into raw bytes with their declared dtype preserved
+  // (float, half, ...). NOTE: small scalars (Clip bounds) are often stored in
+  // float_data(), not raw_data() — materialize those too. FLOAT16 tensors use
+  // int32_data() for raw 16-bit patterns, not numeric integers.
   for (int ii = 0; ii < graph.initializer_size(); ++ii) {
     const auto& init = graph.initializer(ii);
-    auto& ws = weights_[init.name()];
-    const std::string& raw = init.raw_data();
-    ws.data.assign(raw.begin(), raw.end());
-    ws.dtype = init.data_type();
-    if (ws.data.empty()) {
-      if (init.float_data_size() > 0) {
-        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
-        ws.data.resize(init.float_data_size() * 4);
-        std::memcpy(ws.data.data(), init.float_data().data(), ws.data.size());
-      } else if (init.double_data_size() > 0) {
-        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
-        ws.data.resize(init.double_data_size() * 4);
-        for (int k = 0; k < init.double_data_size(); ++k) {
-          float v = static_cast<float>(init.double_data(k));
-          std::memcpy(ws.data.data() + k * 4, &v, 4);
-        }
-      } else if (init.int32_data_size() > 0) {
-        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
-        ws.data.resize(init.int32_data_size() * 4);
-        for (int k = 0; k < init.int32_data_size(); ++k) {
-          float v = static_cast<float>(init.int32_data(k));
-          std::memcpy(ws.data.data() + k * 4, &v, 4);
-        }
-      } else if (init.int64_data_size() > 0) {
-        ws.dtype = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
-        ws.data.resize(init.int64_data_size() * 4);
-        for (int k = 0; k < init.int64_data_size(); ++k) {
-          float v = static_cast<float>(init.int64_data(k));
-          std::memcpy(ws.data.data() + k * 4, &v, 4);
-        }
-      }
+    if (init.name().empty()) {
+      error = "initializer #" + std::to_string(ii) + " has no name";
+      return false;
     }
-    for (int d = 0; d < init.dims_size(); ++d) {
-      ws.shape.push_back(init.dims(d));
-    }
+    if (!MaterializeInitializer(init, weights_[init.name()], error)) return false;
   }
 
   // Attribute lookup helper.
@@ -216,21 +280,44 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   // fp32 model I/O detection (with converter-inserted boundary casts) happens
   // further down, in the same pass that marks the Cast nodes consumed.
 
-  // Clip-bound scalar: fp32 (float) or fp16 (half) initializer -> float.
+  // Clip-bound scalar: fp32 (float), fp16 (half) or double initializer -> float.
   // (The fp16 luma model stores half bounds; the fp32 chroma model stores
   // float bounds. Reading float bits as half gave min=-0.0/max=1.9e-3,
   // clamping all chroma output to ~0.)
-  auto clip_scalar = [&](const std::string& name, float& dst) {
+  auto clip_scalar = [&](const std::string& name, float& dst) -> bool {
     const auto w = weights_.find(name);
-    if (w == weights_.end() || w->second.data.size() < 2) return;
-    if (w->second.dtype == ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
-        w->second.data.size() >= 4) {
-      float v;
-      std::memcpy(&v, w->second.data.data(), 4);
-      dst = v;
-    } else {
-      dst = HipEngine::HalfBitsToFloat(*reinterpret_cast<const uint16_t*>(w->second.data.data()));
+    if (w == weights_.end() || w->second.data.empty()) return true;  // omit -> keep default
+    const auto& ws = w->second;
+    switch (ws.dtype) {
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+        if (ws.data.size() >= 4) {
+          float v;
+          std::memcpy(&v, ws.data.data(), 4);
+          dst = v;
+          return true;
+        }
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE:
+        if (ws.data.size() >= 8) {
+          double v;
+          std::memcpy(&v, ws.data.data(), 8);
+          dst = static_cast<float>(v);
+          return true;
+        }
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+        if (ws.data.size() >= 2) {
+          uint16_t bits;
+          std::memcpy(&bits, ws.data.data(), 2);
+          dst = HipEngine::HalfBitsToFloat(bits);
+          return true;
+        }
+        break;
+      default:
+        break;
     }
+    error = "Clip bound initializer '" + name + "' has an unsupported dtype or truncated storage";
+    return false;
   };
 
   auto read_initializer = [&](const std::string& name, std::vector<uint8_t>& data,
@@ -328,10 +415,53 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
       std::vector<uint8_t> wdata;
       std::vector<int64_t> wdims;
       if (!read_initializer(op.in1, wdata, wdims)) return false;
+
+      // Validate weight geometry / dtype / backing bytes BEFORE any shape
+      // probing or the fixed 3x3 packing loops, which read nine coefficients
+      // unconditionally.
+      if (wdims.size() != 4) {
+        error = "Conv weight '" + op.in1 + "' must be a rank-4 tensor";
+        return false;
+      }
+      if (wdims[2] != 3 || wdims[3] != 3) {
+        error = "Conv weight '" + op.in1 + "' must be 3x3 (got " + std::to_string(wdims[2]) +
+                "x" + std::to_string(wdims[3]) + ")";
+        return false;
+      }
+      if (wdims[0] <= 0 || wdims[1] <= 0) {
+        error = "Conv weight '" + op.in1 + "' has a non-positive channel count";
+        return false;
+      }
+      const int wdtype = weights_[op.in1].dtype;
+      if (wdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
+          wdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+        error = "Conv weight '" + op.in1 + "' has unsupported dtype " + std::to_string(wdtype);
+        return false;
+      }
+      const size_t wbytes = static_cast<size_t>(NumElements(wdims)) * OnnxDtypeSize(wdtype);
+      if (wdata.size() < wbytes) {
+        error = "Conv weight '" + op.in1 + "' storage is truncated (" + std::to_string(wdata.size()) +
+                " bytes, need " + std::to_string(wbytes) + ")";
+        return false;
+      }
       if (!op.conv_bias.empty()) {
         std::vector<uint8_t> bdata;
         std::vector<int64_t> bdims;
         if (!read_initializer(op.conv_bias, bdata, bdims)) return false;
+        if (bdims.size() != 1 || bdims[0] != wdims[0]) {
+          error = "Conv bias '" + op.conv_bias + "' must be a rank-1 tensor with the weight's channel count";
+          return false;
+        }
+        const int bdtype = weights_[op.conv_bias].dtype;
+        if (bdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
+            bdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+          error = "Conv bias '" + op.conv_bias + "' has unsupported dtype " + std::to_string(bdtype);
+          return false;
+        }
+        if (bdata.size() < static_cast<size_t>(bdims[0]) * OnnxDtypeSize(bdtype)) {
+          error = "Conv bias '" + op.conv_bias + "' storage is truncated";
+          return false;
+        }
       }
 
       // Fuse the SiLU (Sigmoid + Mul) epilogue into the conv.
@@ -372,12 +502,16 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
       op.in0 = in_name(0);
       if (auto a = attr(n, "min")) op.clip_min = a->f();
       if (auto a = attr(n, "max")) op.clip_max = a->f();
-      if (n.input_size() > 1 && !n.input(1).empty()) clip_scalar(n.input(1), op.clip_min);
-      if (n.input_size() > 2 && !n.input(2).empty()) clip_scalar(n.input(2), op.clip_max);
+      if (n.input_size() > 1 && !n.input(1).empty() && !clip_scalar(n.input(1), op.clip_min)) return false;
+      if (n.input_size() > 2 && !n.input(2).empty() && !clip_scalar(n.input(2), op.clip_max)) return false;
     } else if (optype == "DepthToSpace") {
       op.type = OpType::DepthToSpace;
       op.in0 = in_name(0);
       if (auto a = attr(n, "blocksize")) op.blocksize = static_cast<int>(a->i());
+      if (op.blocksize < 1) {
+        error = "DepthToSpace blocksize must be positive";
+        return false;
+      }
       if (auto a = attr(n, "mode"); a && a->s() != "DCR") {
         error = "only DepthToSpace mode DCR is supported";
         return false;
@@ -388,8 +522,8 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         if (cn.op_type() != "Clip" || consumed[ci]) continue;
         if (auto a = attr(cn, "min")) op.clip_min = a->f();
         if (auto a = attr(cn, "max")) op.clip_max = a->f();
-        if (cn.input_size() > 1 && !cn.input(1).empty()) clip_scalar(cn.input(1), op.clip_min);
-        if (cn.input_size() > 2 && !cn.input(2).empty()) clip_scalar(cn.input(2), op.clip_max);
+        if (cn.input_size() > 1 && !cn.input(1).empty() && !clip_scalar(cn.input(1), op.clip_min)) return false;
+        if (cn.input_size() > 2 && !cn.input(2).empty() && !clip_scalar(cn.input(2), op.clip_max)) return false;
         op.fuse_clip = true;
         consumed[ci] = true;
         op.out = cn.output(0);  // produce the Clip's output tensor directly
@@ -428,15 +562,43 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
     }
   }
 
+  // Validate binary-op operands: the engine implements same-shape elementwise
+  // Mul/Add between two engine-produced activations only. Initializer-backed
+  // constants (including the ubiquitous `x * 0.25`) and ONNX broadcasting are
+  // not implemented, so reject them here instead of launching with a null
+  // activation pointer (which dereferences null in the kernel). Runs after the
+  // Add fusion so the fused residual input is validated too.
+  {
+    std::unordered_set<std::string> produced;
+    for (const auto& op : ops_) produced.insert(op.out);
+    auto require_activation = [&](const std::string& what, const std::string& name) -> bool {
+      if (produced.count(name) == 0) {
+        error = what + " operand '" + name +
+                "' is not an activation produced in this graph; initializer constants, graph "
+                "inputs and broadcasting are not supported";
+        return false;
+      }
+      return true;
+    };
+    for (const OpSpec& op : ops_) {
+      if (op.type == OpType::Sigmoid || op.type == OpType::Clip) {
+        if (!require_activation("unary op", op.in0)) return false;
+      } else if (op.type == OpType::Mul) {
+        if (!require_activation("Mul", op.in0) || !require_activation("Mul", op.in1)) return false;
+      } else if (op.type == OpType::Add) {
+        if (!require_activation("Add", op.in0) || !require_activation("Add", op.in1)) return false;
+      } else if (op.type == OpType::Conv && op.do_add) {
+        if (!require_activation("fused residual Add", op.add_input)) return false;
+      }
+    }
+  }
+
   // The engine uses the same GPU as the EP: init once here.
   if (hipInit(0) != hipSuccess) {
     error = "hipInit failed";
     return false;
   }
-  if (hipSetDevice(device_id_) != hipSuccess) {
-    error = "hipSetDevice failed";
-    return false;
-  }
+  if (!SetDevice(error)) return false;
   if (hipStreamCreateWithFlags(reinterpret_cast<hipStream_t*>(&stream_), hipStreamNonBlocking) != hipSuccess) {
     error = "hipStreamCreate failed";
     return false;
@@ -445,9 +607,19 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   return true;
 }
 
+bool HipEngine::SetDevice(std::string& error) const {
+  hipError_t e = hipSetDevice(device_id_);
+  if (e != hipSuccess) {
+    error = "hipSetDevice(" + std::to_string(device_id_) + ") failed: " + hipGetErrorString(e);
+    return false;
+  }
+  return true;
+}
+
 bool HipEngine::PropagateShapes(const std::vector<int64_t>& input_shape,
                                 std::unordered_map<std::string, std::vector<int64_t>>& shapes) const {
   if (input_shape.size() != 4) return false;
+  if (input_shape[0] != 1) return false;  // kernels have no batch dimension
   shapes.clear();
   // Internal tensors use the NHWC [N,H,W,C] layout.
   shapes[input_name_] = {input_shape[0], input_shape[2], input_shape[3], input_shape[1]};
@@ -455,25 +627,47 @@ bool HipEngine::PropagateShapes(const std::vector<int64_t>& input_shape,
     const auto& in = shapes.find(op.in0);
     if (in == shapes.end()) return false;
     const auto& s = in->second;
+    if (s.size() != 4) return false;
     std::vector<int64_t> out_shape;
     switch (op.type) {
       case OpType::Conv: {
         const auto& w = weights_.find(op.in1);
         if (w == weights_.end()) return false;
+        if (w->second.shape.size() != 4) return false;
+        // Channel agreement: the weight's input channel count must match the
+        // activation's channel count, or the kernels read the wrong stride.
+        if (w->second.shape[1] != s[3]) return false;
         int64_t m = w->second.shape[0];
         int64_t oh = (s[1] + 2 * op.pad_h - op.dil_h * 2 - 1) / op.stride_h + 1;
         int64_t ow = (s[2] + 2 * op.pad_w - op.dil_w * 2 - 1) / op.stride_w + 1;
+        if (oh <= 0 || ow <= 0) return false;
         out_shape = {s[0], oh, ow, m};
+        // A fused residual input must match the conv output exactly: the
+        // kernel indexes it with the conv output's geometry.
+        if (op.do_add) {
+          const auto& add_shape = shapes.find(op.add_input);
+          if (add_shape == shapes.end() || add_shape->second != out_shape) return false;
+        }
         break;
       }
       case OpType::Sigmoid:
-      case OpType::Mul:
-      case OpType::Add:
       case OpType::Clip:
         out_shape = s;
         break;
+      case OpType::Mul:
+      case OpType::Add: {
+        // The kernels implement same-shape elementwise ops only; ONNX
+        // broadcasting would read the second operand out of bounds.
+        const auto& rhs = shapes.find(op.in1);
+        if (rhs == shapes.end()) return false;
+        if (rhs->second != s) return false;
+        out_shape = s;
+        break;
+      }
       case OpType::DepthToSpace: {
         int64_t b = op.blocksize;
+        if (b < 1) return false;
+        if (s[3] % (b * b) != 0) return false;  // C must split into whole blocks
         out_shape = {s[0], s[1] * b, s[2] * b, s[3] / (b * b)};
         break;
       }
@@ -534,8 +728,23 @@ size_t HipEngine::OutputBytes(const std::vector<int64_t>& input_shape) const {
 
 bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string& error) {
   if (built_ && input_shape == built_input_shape_) return true;
+  // HIP's current device is thread-local and this runs on VapourSynth worker
+  // threads, so re-select before creating or destroying any resource.
+  if (!SetDevice(error)) return false;
   if (input_shape.size() != 4) {
     error = "expected 4D input tensor";
+    return false;
+  }
+
+  // The kernels have no batch dimension: they index only H/W/C/M, so N must
+  // be 1 or only the first image would be produced.
+  if (input_shape[0] != 1) {
+    error = "batch size must be 1 (the kernels do not implement a batch dimension)";
+    return false;
+  }
+  // The Winograd strip geometry needs at least one 2x2 output tile row/column.
+  if (input_shape[2] < 2 || input_shape[3] < 2) {
+    error = "input height and width must be at least 2";
     return false;
   }
 
@@ -544,7 +753,8 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
 
   std::unordered_map<std::string, std::vector<int64_t>> shapes;
   if (!PropagateShapes(input_shape, shapes) || shapes.find(output_name_) == shapes.end()) {
-    error = "shape propagation failed";
+    error = "shape propagation failed (unsupported convolution geometry, channel mismatch, or "
+            "DepthToSpace block size)";
     return false;
   }
 
@@ -559,6 +769,14 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
     }
   }
   last_use[output_name_] = static_cast<int>(ops_.size());
+
+  // Any HIP failure below unwinds the partially created device state instead
+  // of leaving null staging pointers or invalid tensor indices behind.
+  auto hip_fail = [&](const char* what, hipError_t e) -> bool {
+    error = std::string(what) + " failed: " + hipGetErrorString(e);
+    DestroyDeviceState();
+    return false;
+  };
 
   std::vector<std::pair<int, int>> slots;
   auto alloc_tensor = [&](const std::string& name, const std::vector<int64_t>& shape,
@@ -575,8 +793,10 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
     }
     if (buffer_index < 0) {
       void* ptr = nullptr;
-      if (hipMalloc(&ptr, bytes) != hipSuccess) {
-        error = "hipMalloc failed";
+      hipError_t e = hipMalloc(&ptr, bytes);
+      if (e != hipSuccess) {
+        error = std::string("hipMalloc of ") + std::to_string(bytes) + " bytes for tensor '" + name +
+                "' failed: " + hipGetErrorString(e);
         return -1;
       }
       HipBuffer buf{ptr, bytes};
@@ -589,22 +809,33 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
     info.buffer_index = buffer_index;
     tensor_map_[name] = info;
     if (constant_data != nullptr) {
-      hipMemcpy(buffers_[buffer_index].ptr, constant_data, constant_bytes, hipMemcpyHostToDevice);
+      hipError_t e = hipMemcpy(buffers_[buffer_index].ptr, constant_data, constant_bytes,
+                               hipMemcpyHostToDevice);
+      if (e != hipSuccess) {
+        error = std::string("hipMemcpy of constant '") + name + "' failed: " + hipGetErrorString(e);
+        return -1;
+      }
     }
     return buffer_index;
   };
 
   input_buffer_ = alloc_tensor(input_name_, shapes[input_name_], nullptr, 0, 0);
-  if (input_buffer_ < 0) return false;
+  if (input_buffer_ < 0) {
+    DestroyDeviceState();
+    return false;
+  }
   for (size_t oi = 0; oi < ops_.size(); ++oi) {
     const auto& op = ops_[oi];
     const int producer = static_cast<int>(oi);
-    alloc_tensor(op.in0, shapes[op.in0], nullptr, 0, producer);
-    if (!op.in1.empty() && !weights_.count(op.in1)) alloc_tensor(op.in1, shapes[op.in1], nullptr, 0, producer);
-    if (op.do_add && !op.add_input.empty() && !weights_.count(op.add_input)) {
-      alloc_tensor(op.add_input, shapes[op.add_input], nullptr, 0, producer);
+    if (alloc_tensor(op.in0, shapes[op.in0], nullptr, 0, producer) < 0 ||
+        (!op.in1.empty() && !weights_.count(op.in1) &&
+         alloc_tensor(op.in1, shapes[op.in1], nullptr, 0, producer) < 0) ||
+        (op.do_add && !op.add_input.empty() && !weights_.count(op.add_input) &&
+         alloc_tensor(op.add_input, shapes[op.add_input], nullptr, 0, producer) < 0) ||
+        alloc_tensor(op.out, shapes[op.out], nullptr, 0, producer) < 0) {
+      DestroyDeviceState();
+      return false;
     }
-    alloc_tensor(op.out, shapes[op.out], nullptr, 0, producer);
   }
   output_buffer_ = tensor_map_[output_name_].buffer_index;
 
@@ -628,6 +859,13 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
         const uint32_t C_blocks = C_pad / 16u;
         const int in_idx = tensor_map_[op.in0].buffer_index;
 
+        // The compact kernels cover at most 64 output channels: direct_conv
+        // writes co in [0,56]+8 and winograd's four wave32s own exactly four
+        // 16-ko k-blocks. Larger M would silently leave channels unwritten.
+        if (M > 64u) {
+          error = "conv supports at most 64 output channels (got " + std::to_string(M) + ")";
+          return false;
+        }
         if (C == 1u) {
           // Direct 3x3 kernel for the C=1 first conv: [t][c][co] + bias.
           const uint32_t wt_size = 9u * C * M + M;
@@ -647,8 +885,12 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
             }
           }
           void* wt_d = nullptr;
-          hipMalloc(&wt_d, d_buf.size() * 2);
-          hipMemcpy(wt_d, d_buf.data(), d_buf.size() * 2, hipMemcpyHostToDevice);
+          {
+            hipError_t e = hipMalloc(&wt_d, d_buf.size() * 2);
+            if (e != hipSuccess) return hip_fail("hipMalloc of direct-conv weights", e);
+            e = hipMemcpy(wt_d, d_buf.data(), d_buf.size() * 2, hipMemcpyHostToDevice);
+            if (e != hipSuccess) return hip_fail("hipMemcpy of direct-conv weights", e);
+          }
           int wt_idx = static_cast<int>(buffers_.size());
           buffers_.push_back(HipBuffer{wt_d, d_buf.size() * 2});
 
@@ -662,7 +904,9 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
           p.do_add = op.do_add ? 1u : 0u;
           dop.params.resize(sizeof(WinogradPush) / sizeof(uint32_t));
           std::memcpy(dop.params.data(), &p, sizeof(p));
-          dop.dispatch_x = W / 8u;
+          // 8 pixels per block, 2D grid; ceil so widths that are not a
+          // multiple of 8 still schedule their final partial block.
+          dop.dispatch_x = DivCeil(W, 8u);
           dop.dispatch_y = H;
           dop.dispatch_z = 1;
           dop.input_buffers = {in_idx, wt_idx, add_idx};
@@ -708,8 +952,12 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
           }
         }
         void* wt_u = nullptr;
-        hipMalloc(&wt_u, u_buf.size() * 2);
-        hipMemcpy(wt_u, u_buf.data(), u_buf.size() * 2, hipMemcpyHostToDevice);
+        {
+          hipError_t e = hipMalloc(&wt_u, u_buf.size() * 2);
+          if (e != hipSuccess) return hip_fail("hipMalloc of winograd weights", e);
+          e = hipMemcpy(wt_u, u_buf.data(), u_buf.size() * 2, hipMemcpyHostToDevice);
+          if (e != hipSuccess) return hip_fail("hipMemcpy of winograd weights", e);
+        }
         int wt_idx = static_cast<int>(buffers_.size());
         buffers_.push_back(HipBuffer{wt_u, u_buf.size() * 2});
 
@@ -717,18 +965,27 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
         if (op.do_add && !op.add_input.empty() && tensor_map_.count(op.add_input)) {
           add_idx = tensor_map_[op.add_input].buffer_index;
         }
+        if (op.do_add && !op.add_input.empty() && add_idx == wt_idx) {
+          error = "fused residual add input '" + op.add_input + "' has no device buffer";
+          return false;
+        }
         WinogradPush p{};
         p.h = H; p.w = W; p.c = C; p.m = M;
         p.m_pad = M_pad; p.c_pad = C_pad;
-        p.tiles_w = W / 2u;
+        // Kernel tile geometry: each workgroup covers a 2-row x 8-tile-column
+        // region (16 F(2x2) tiles). Round the tile counts UP so odd H/W and
+        // partial regions are still scheduled; the kernel guards the writes.
+        const uint32_t tiles_w = (W + 1u) / 2u;
+        const uint32_t tiles_h = (H + 1u) / 2u;
+        p.tiles_w = tiles_w;
         p.do_silu = op.do_silu ? 1u : 0u;
         p.do_add = op.do_add ? 1u : 0u;
         dop.params.resize(sizeof(WinogradPush) / sizeof(uint32_t));
         std::memcpy(dop.params.data(), &p, sizeof(p));
-        const uint32_t nt_total = (H / 2u) * (W / 2u);
-        const uint32_t nt_wg = (nt_total + 15u) / 16u;
+        const uint32_t tiles_w8 = (tiles_w + 7u) / 8u;   // workgroups per tile row
+        const uint32_t row_pairs = (tiles_h + 1u) / 2u;  // 2 tile rows per workgroup
         const uint32_t kgroups = M_pad / 32u;
-        dop.dispatch_x = nt_wg * ((kgroups + 1u) / 2u);
+        dop.dispatch_x = tiles_w8 * row_pairs * ((kgroups + 1u) / 2u);
         dop.dispatch_y = 1u;
         dop.dispatch_z = 1u;
         dop.input_buffers = {in_idx, wt_idx, add_idx};
@@ -793,21 +1050,30 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
                          : 0;
   output_ort_bytes_ = output_bytes_ * (output_is_fp32_ ? 2 : 1);
 
-  hipHostMalloc(&input_staging_, input_bytes_, hipHostMallocDefault);
-  hipHostMalloc(&output_staging_, output_bytes_, hipHostMallocDefault);
-  if (input_is_fp32_) {
-    // Raw-fp32 upload path: pinned host staging + device fp32 buffer.
-    hipHostMalloc(&input_staging_f32_, input_ort_bytes_, hipHostMallocDefault);
-    hipMalloc(&input_f32_dev_, input_ort_bytes_);
+  {
+    hipError_t e = hipHostMalloc(&input_staging_, input_bytes_, hipHostMallocDefault);
+    if (e != hipSuccess) return hip_fail("hipHostMalloc of input staging", e);
+    e = hipHostMalloc(&output_staging_, output_bytes_, hipHostMallocDefault);
+    if (e != hipSuccess) return hip_fail("hipHostMalloc of output staging", e);
+    if (input_is_fp32_) {
+      // Raw-fp32 upload path: pinned host staging + device fp32 buffer.
+      e = hipHostMalloc(&input_staging_f32_, input_ort_bytes_, hipHostMallocDefault);
+      if (e != hipSuccess) return hip_fail("hipHostMalloc of fp32 input staging", e);
+      e = hipMalloc(&input_f32_dev_, input_ort_bytes_);
+      if (e != hipSuccess) return hip_fail("hipMalloc of fp32 input buffer", e);
+    }
+    if (output_is_fp32_) {
+      // fp32 download path: device fp32 buffer (on-device cast target) +
+      // pinned host staging. The device fp16 output buffer stays the kernels'
+      // write target; the cast reads it after the last op.
+      e = hipHostMalloc(&output_staging_f32_, output_ort_bytes_, hipHostMallocDefault);
+      if (e != hipSuccess) return hip_fail("hipHostMalloc of fp32 output staging", e);
+      e = hipMalloc(&output_f32_dev_, output_ort_bytes_);
+      if (e != hipSuccess) return hip_fail("hipMalloc of fp32 output buffer", e);
+    }
+    e = hipDeviceSynchronize();
+    if (e != hipSuccess) return hip_fail("hipDeviceSynchronize after setup", e);
   }
-  if (output_is_fp32_) {
-    // fp32 download path: device fp32 buffer (on-device cast target) +
-    // pinned host staging. The device fp16 output buffer stays the kernels'
-    // write target; the cast reads it after the last op.
-    hipHostMalloc(&output_staging_f32_, output_ort_bytes_, hipHostMallocDefault);
-    hipMalloc(&output_f32_dev_, output_ort_bytes_);
-  }
-  hipDeviceSynchronize();
 
   {
     static const bool dbg2 = [] { const char* e = std::getenv("VSHIP_DEBUG"); return e && *e == '1'; }();
@@ -877,12 +1143,20 @@ bool HipEngine::FloatToHalfBitsRNE(float f, uint16_t& h) {
 }
 
 float HipEngine::WeightFloat(const std::vector<uint8_t>& data, int dtype, size_t idx) {
+  // Build() validates dtype and element count before any transform reads
+  // these; the guards below only keep a future caller from walking off the
+  // end of the buffer.
   if (dtype == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    if ((idx + 1) * 4 > data.size()) return 0.0f;
     float v;
     std::memcpy(&v, data.data() + idx * 4, 4);
     return v;
   }
-  return HalfBitsToFloat(reinterpret_cast<const uint16_t*>(data.data())[idx]);
+  if (dtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) return 0.0f;
+  if ((idx + 1) * 2 > data.size()) return 0.0f;
+  uint16_t bits;
+  std::memcpy(&bits, data.data() + idx * 2, 2);
+  return HalfBitsToFloat(bits);
 }
 
 float HipEngine::HalfBitsToFloat(uint16_t h) {
@@ -920,16 +1194,34 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
   if (trc) { my_no = ++run_no; fprintf(stderr, "[run] enter #%llu in=%p\n",
                                        (unsigned long long)my_no, input_data); fflush(stderr); }
   std::lock_guard<std::mutex> lock(mutex_);
+  // Consume any error left in the thread-local last-error slot by an earlier
+  // failed call on this thread (e.g. a reported hipMalloc failure): otherwise
+  // the launch check below would misattribute it to this frame's kernel.
+  (void)hipGetLastError();
+  // Re-select the owning device: HIP's current device is thread-local and
+  // VapourSynth may hand a frame to a different worker thread each call.
+  if (!SetDevice(error)) return false;
   if (!EnsureBuilt(input_shape, error)) return false;
   if (trc) fprintf(stderr, "[run] built #%llu\n", (unsigned long long)my_no), fflush(stderr);
 
   hipStream_t stream = static_cast<hipStream_t>(stream_);
 
+  // Every HIP call below is checked: a failed transfer, launch or
+  // synchronization must surface as a frame error instead of a silently
+  // stale/unwritten output buffer.
+  auto run_fail = [&](const char* what, hipError_t e) -> bool {
+    error = std::string(what) + " failed: " + hipGetErrorString(e);
+    return false;
+  };
+
   if (input_is_fp32_) {
     // Raw fp32 upload + on-device cast (no CPU per-pixel conversion).
     std::memcpy(input_staging_f32_, input_data, input_ort_bytes_);
-    hipMemcpyAsync(input_f32_dev_, input_staging_f32_, input_ort_bytes_,
-                   hipMemcpyHostToDevice, stream);
+    {
+      hipError_t e = hipMemcpyAsync(input_f32_dev_, input_staging_f32_, input_ort_bytes_,
+                                    hipMemcpyHostToDevice, stream);
+      if (e != hipSuccess) return run_fail("HIP fp32 input upload", e);
+    }
     // NCHW upload -> NHWC compute buffer: fused transpose + cast.
     // (built_input_shape_ is NCHW; C=1 makes this a plain cast.)
     {
@@ -943,6 +1235,8 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
                          static_cast<const float*>(input_f32_dev_),
                          static_cast<_Float16*>(buffers_[input_buffer_].ptr),
                          iN, iC, iH, iW);
+      hipError_t e = hipGetLastError();
+      if (e != hipSuccess) return run_fail("HIP f32->f16 input cast launch", e);
     }
     {
       static const bool dbg = [] { const char* e = std::getenv("VSHIP_DEBUG"); return e && *e == '1'; }();
@@ -955,7 +1249,9 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     }
   } else {
     std::memcpy(input_staging_, input_data, input_bytes_);
-    hipMemcpyAsync(buffers_[input_buffer_].ptr, input_staging_, input_bytes_, hipMemcpyHostToDevice, stream);
+    hipError_t e = hipMemcpyAsync(buffers_[input_buffer_].ptr, input_staging_, input_bytes_,
+                                  hipMemcpyHostToDevice, stream);
+    if (e != hipSuccess) return run_fail("HIP input upload", e);
   }
 
   // VSHIP_PROFILE=1: per-op GPU timestamps via HIP events.
@@ -963,16 +1259,40 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
   std::vector<hipEvent_t> ev;
   if (prof) {
     ev.resize(2u * device_ops_.size() + 2u);
-    for (auto& e : ev) hipEventCreate(&e);
-    hipEventRecord(ev[0], stream);
+    for (auto& e : ev) {
+      hipError_t ce = hipEventCreate(&e);
+      if (ce != hipSuccess) {
+        for (auto& d : ev) {
+          if (d) hipEventDestroy(d);
+        }
+        return run_fail("HIP event creation", ce);
+      }
+    }
+    hipError_t re = hipEventRecord(ev[0], stream);
+    if (re != hipSuccess) {
+      for (auto& d : ev) hipEventDestroy(d);
+      return run_fail("HIP event record", re);
+    }
   }
+  // Releases profiling events on any early return.
+  auto destroy_events = [&]() {
+    if (prof) {
+      for (auto& d : ev) hipEventDestroy(d);
+    }
+  };
 
   if (trc) fprintf(stderr, "[run] #%llu cast launched\n", (unsigned long long)my_no), fflush(stderr);
   bool dts_fused_fp32 = false;
   for (size_t dop_i = 0; dop_i < device_ops_.size(); ++dop_i) {
     const auto& dop = device_ops_[dop_i];
     if (trc) fprintf(stderr, "[run] #%llu op%zu type=%d\n", (unsigned long long)my_no, dop_i, (int)dop.type), fflush(stderr);
-    if (prof) hipEventRecord(ev[1u + 2u * dop_i], stream);
+    if (prof) {
+      hipError_t re = hipEventRecord(ev[1u + 2u * dop_i], stream);
+      if (re != hipSuccess) {
+        destroy_events();
+        return run_fail("HIP event record", re);
+      }
+    }
     void* in_bufs[3] = {nullptr, nullptr, nullptr};
     for (size_t i = 0; i < dop.input_buffers.size() && i < 3; ++i) {
       if (dop.input_buffers[i] >= 0) in_bufs[i] = buffers_[dop.input_buffers[i]].ptr;
@@ -1017,20 +1337,41 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
       case OpType::DepthToSpace: {
         DtsParams p{};
         std::memcpy(&p, dop.params.data(), sizeof(p));
-        if (output_is_fp32_ && dop.output_buffer == output_buffer_) {
+        if (output_is_fp32_ && dop.output_buffer == output_buffer_ && p.b == 2u) {
           // Final-output DTS on an fp32-output model: input-centric pass
           // writes floats directly, skipping the separate cast over 8M px.
+          // Restricted to blocksize 2, which is what the kernel's whole-block
+          // half4 load and B*B layout implement.
           hipLaunchKernelGGL(dts_kernel_in_f32, dim3(DivCeil(p.w, 32u), DivCeil(p.h, 8u)), dim3(32, 8), 0, stream,
                              static_cast<const _Float16*>(in_bufs[0]), static_cast<float*>(output_f32_dev_), p);
           dts_fused_fp32 = true;
         } else {
+          // Generic fp16 DTS; a non-2 block size on an fp32-output model is
+          // converted by the trailing cast below.
           hipLaunchKernelGGL(dts_kernel_2d, dim3(dop.dispatch_x, dop.dispatch_y), dim3(32, 8), 0, stream,
                              static_cast<const _Float16*>(in_bufs[0]), static_cast<_Float16*>(out_buf), p);
         }
         break;
       }
     }
-    if (prof) hipEventRecord(ev[2u + 2u * dop_i], stream);
+    // hipLaunchKernelGGL discards its launch status; read it before the next
+    // HIP call can overwrite the last-error slot.
+    {
+      hipError_t le = hipGetLastError();
+      if (le != hipSuccess) {
+        destroy_events();
+        error = "HIP kernel launch for op " + std::to_string(dop_i) + " failed: " +
+                hipGetErrorString(le);
+        return false;
+      }
+    }
+    if (prof) {
+      hipError_t re = hipEventRecord(ev[2u + 2u * dop_i], stream);
+      if (re != hipSuccess) {
+        destroy_events();
+        return run_fail("HIP event record", re);
+      }
+    }
   }
 
   if (output_is_fp32_) {
@@ -1051,15 +1392,37 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
                          static_cast<const _Float16*>(buffers_[output_buffer_].ptr),
                          static_cast<float*>(output_f32_dev_),
                          oN, oC, oH, oW);
+      hipError_t le = hipGetLastError();
+      if (le != hipSuccess) {
+        destroy_events();
+        return run_fail("HIP f16->f32 output cast launch", le);
+      }
     }
-    hipMemcpyAsync(output_staging_f32_, output_f32_dev_, output_ort_bytes_,
-                   hipMemcpyDeviceToHost, stream);
+    hipError_t e = hipMemcpyAsync(output_staging_f32_, output_f32_dev_, output_ort_bytes_,
+                                  hipMemcpyDeviceToHost, stream);
+    if (e != hipSuccess) {
+      destroy_events();
+      return run_fail("HIP fp32 output download", e);
+    }
   } else {
-    hipMemcpyAsync(output_staging_, buffers_[output_buffer_].ptr, output_bytes_, hipMemcpyDeviceToHost, stream);
+    hipError_t e = hipMemcpyAsync(output_staging_, buffers_[output_buffer_].ptr, output_bytes_,
+                                  hipMemcpyDeviceToHost, stream);
+    if (e != hipSuccess) {
+      destroy_events();
+      return run_fail("HIP output download", e);
+    }
   }
   if (prof) {
-    hipEventRecord(ev[2u * device_ops_.size()], stream);
-    hipEventSynchronize(ev[2u * device_ops_.size()]);
+    hipError_t re = hipEventRecord(ev[2u * device_ops_.size()], stream);
+    if (re != hipSuccess) {
+      destroy_events();
+      return run_fail("HIP final event record", re);
+    }
+    hipError_t se = hipEventSynchronize(ev[2u * device_ops_.size()]);
+    if (se != hipSuccess) {
+      destroy_events();
+      return run_fail("HIP profiling event synchronize", se);
+    }
     float ms = 0.f;
     static uint64_t frame_no = 0;
     const bool report = frame_no++ < 3 || (frame_no % 128 == 0);
@@ -1073,9 +1436,14 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
       }
       fflush(stderr);
     }
-    for (auto& e : ev) hipEventDestroy(e);
+    destroy_events();
   }
-  hipStreamSynchronize(stream);
+  // Propagate execution failures: without this a kernel fault (or a device
+  // loss) still looks like a successful frame over stale staging data.
+  {
+    hipError_t e = hipStreamSynchronize(stream);
+    if (e != hipSuccess) return run_fail("HIP stream synchronize", e);
+  }
 
   if (output_is_fp32_) {
     std::memcpy(output_data, output_staging_f32_, output_ort_bytes_);

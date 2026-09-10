@@ -94,7 +94,13 @@ class HipContext {
   HipContext();
   ~HipContext();
 
-  bool Initialize();
+  // Selects and validates device_id, then creates the stream on it.
+  bool Initialize(int device_id);
+  bool initialized() const { return initialized_; }
+  int DeviceId() const { return device_; }
+  // HIP's current device is thread-local; re-select this context's device on
+  // the calling thread. Returns a failing status when the device is not usable.
+  common::Status SetDevice() const;
   void* Stream() const { return stream_; }
 
  private:

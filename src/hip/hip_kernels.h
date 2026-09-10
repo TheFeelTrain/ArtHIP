@@ -121,7 +121,10 @@ __global__ void winograd_conv(
   const uint lane = threadIdx.x % 32;
   const uint wg = blockIdx.x;
 
-  const uint tiles_w8 = p.tiles_w / 8u;
+  // Workgroups per tile row; round up so partial tile columns are scheduled.
+  // Zero would make the row/tw split below divide by zero.
+  const uint tiles_w8 = (p.tiles_w + 7u) / 8u;
+  if (tiles_w8 == 0u) return;
   const uint kgroups = p.M_pad / 16u;
   const uint kgroup = min(wave, kgroups - 1u);
   const uint row_pair = wg / tiles_w8;
@@ -509,11 +512,7 @@ __global__ __launch_bounds__(256) void dts_kernel(
 // 2D-grid DTS for the standalone plugin engine (the EP keeps dts_kernel above).
 // ow/oh come straight from block/thread indices: zero div/mod in the common
 // path (only h=oh/B, w=ow/B remain). C is looped (C==1 on the ArtCNN tail).
-// _in_f32 is input-centric: one thread per INPUT pixel loads its whole
-// B*B*C block as contiguous half4s (coalesced) and scatters float outputs -
-// loads stall warps, scattered stores don't. It also fuses the fp16->fp32
-// output cast (clip in fp32), so the tail needs no extra pass over 8M px.
-// NOTE: dts_kernel_in_f32 assumes blocksize 2 (whole-block half4 load).
+// Caller must check p.b >= 1 and p.c * p.b * p.b <= input channel count.
 __global__ __launch_bounds__(256) void dts_kernel_2d(
     const _Float16* __restrict__ in, _Float16* __restrict__ out, DtsParams p)
 {
@@ -537,6 +536,13 @@ __global__ __launch_bounds__(256) void dts_kernel_2d(
   }
 }
 
+// Input-centric final fp32 DTS: one thread per INPUT pixel loads its whole
+// B*B*C block as contiguous half4s (coalesced) and scatters float outputs -
+// loads stall warps, scattered stores don't. Also fuses the fp16->fp32 output
+// cast (clip in fp32), so the tail needs no extra pass over 8M px.
+// REQUIRES p.b == 2: the whole-block half4 load and the B*B=4 layout are
+// hard-coded, and p.b == 1/3 over-reads or mis-indexes. Callers must fall back
+// to dts_kernel_2d otherwise.
 __global__ __launch_bounds__(256) void dts_kernel_in_f32(
     const _Float16* __restrict__ in, float* __restrict__ out, DtsParams p)
 {

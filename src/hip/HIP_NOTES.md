@@ -29,6 +29,80 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
   class to the pre-change 0.0117/0.0112. base on real jpbd frame 0: luma max
   0.00097, 0% > 0.02; U/V bit-identical (Catrom path, model not involved).
 
+## P1 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 1-9
+
+All nine [P1] findings from REVIEW.md are fixed in the tree; P2/performance
+items are untouched and still open. The engine/EP now REJECT what they cannot
+compute correctly instead of reading out of bounds or silently under-writing.
+Verified with `tmp/p1_tests/` (29 checks, GPU): engine fixtures vs numpy, EP
+vs CPU, plugin via vspipe. Pre-fix A/B (`tmp/p1_tests/before`,
+`ep_before/libonnxruntime_providers_hip.so`, `plugin_before/libhip_before.so`)
+fails 10 of the same checks, so the tests demonstrate the bugs.
+
+- **#1 subsampled/channel mismatch (vs_hip.cpp).** Creation rejects
+  subSamplingW/H != 0 (no resampling path exists) and requires
+  `fmt.numPlanes == model input channels` (model C>3 also rejected); GetFrame
+  re-checks per-plane W/H and the plane count for variable-format clips. The
+  old `pi = (numPlanes>1)?p:0` luma-replication for single-plane clips is gone
+  (it was only reachable when the counts already disagreed).
+- **#2 weight validation (hip_engine.cc, hip_graph.cc).** Before ANY shape
+  probe or the fixed 9-tap packing: weight rank==4, dims[2..3]==3, M/C>0,
+  dtype float/float16, backing bytes >= numel*elem; bias rank==1 and
+  length==M with the same dtype/byte checks. External-data initializers are
+  rejected at materialization. EP gets the same checks (it already checked
+  3x3 in the capability predicate, but Compile is the real boundary).
+- **#7 typed fp16 initializers (hip_engine.cc).** FLOAT16 values stored in
+  `int32_data` are 16-bit BIT PATTERNS; they are now unpacked as such instead
+  of being numerically converted and re-typed (identity kernel with typed
+  storage was 15295.0 off, now bit-exact). dtype is preserved from the proto.
+  This also fixes ArtHIP's own converter output (`convert_float_to_float16`
+  emits `int32_data` for float16).
+- **#8 constant/broadcast binary ops (both).** After Add fusion, every
+  Mul/Add/Sigmoid/Clip/fused-residual operand must be an activation produced
+  in the graph, and binary operands must have identical shapes. Initializer
+  constants and graph inputs now fail at Build/Compile instead of binding a
+  null device buffer (the `x + 0.25` ASan/UBSan crash). Broadcasting is
+  rejected, not implemented.
+- **#9 DTS blocksize (hip_engine.cc, hip_kernels.h).** `dts_kernel_in_f32`
+  is used only when blocksize==2 (was: any final fp32 DTS); blocksize 1/3 fall
+  back to `dts_kernel_2d` + the cast. blocksize>=1 and `C % B^2 == 0` are
+  validated in shape propagation. b=3 was 1.37 wrong, now 0.0005.
+- **#3 dispatch geometry (hip_engine.cc, hip_graph.cc, hip_kernels.h).** N
+  must be 1; H,W >= 2. Direct conv: `ceil(W/8)` 2D grid (was `W/8`, zero
+  blocks below W=8). Winograd: `ceil` tile counts, dispatch
+  `tiles_w8 * row_pairs * kgroups_pairs` (space-filling, was
+  `ceil(floor(H/2)*floor(W/2)/16)` which skipped the last band, e.g. 1920x1082)
+  and the kernel derives `tiles_w8 = ceil(tiles_w/8)` with a zero guard (was
+  a divide-by-zero for W<16). M>64 is rejected in both paths (direct writes
+  <=64 channels; winograd's 4 waves cover exactly 64) instead of under-writing.
+  A 12-size H/W sweep (odd, non-multiple-of-16, 1082 rows, 1920 wide) is now
+  within 0.0005/0.0022; pre-fix it was 3.0/3.6.
+- **#5 error propagation (both).** Every allocation, transfer, launch, event
+  and `hipStreamSynchronize` is checked; failures report the HIP error string
+  and unwind partial device state (staging pointers, buffer indices) so a
+  later frame on the same engine still works. `hipLaunchKernelGGL` discards
+  its status, so `hipGetLastError()` is read after each launch — with a
+  last-error consume at Run() entry so a previously REPORTED failure is not
+  misattributed to this frame's launch. The EP returned OK on a forced
+  synchronization error before; it now fails the node.
+- **#6 device selection (both).** HIP's current device is thread-local, so
+  `HipEngine::Run`/`EnsureBuilt`/`DestroyDeviceState` and the EP's
+  `HipGraph` paths re-select the owning device. `HipContext::Initialize` takes
+  the configured `device_id`, validates the ordinal, and creates the stream on
+  it; `info_.device_id` is now actually wired (it was hard-coded to 0). A
+  failed context init makes GetCapability return empty and Compile fail, so
+  the EP never advertises nodes it cannot run.
+- **#4 EP fp16->fp32 output cast (hip_graph.cc).** The half source is read
+  from the pinned staging COPY, not from `output_data` (which the wider float
+  writes were overwriting). The review's `[0.25,0.5,0.75,1]` case now converts
+  correctly (0.00011 vs reference; pre-fix 512.0 off).
+
+Gate after the fixes (all on the RX 7900 XTX): luma 320x180 vs MIGX maxdiff
+0.001884 (0% >0.02), chroma 0.000/0.0095/0.0083 (0% >0.02), EP multires 256
+HIP-vs-CPU 0.00098 = MIGX-vs-CPU 0.00098. Paired 100f: base hip 21.6-21.9 vs
+migx 14.7, chroma hip 22.0 vs migx 19.1 — unchanged from the pre-fix build, so
+the added validation costs nothing measurable.
+
 ## VapourSynth API4 port (2026-09-10, SHIPPED)
 
 vs_hip.cpp moved from API3 to API4 (`VapourSynthPluginInit2` / `configPlugin` /
@@ -159,6 +233,15 @@ FAILED / REVERTED (do not blind-retry):
 
 ## OPEN QUESTIONS
 
+- RARE luma nondeterminism (observed 2026-09-10, NOT reproduced): one luma
+  320x180 run out of ~17 differed from every other run by up to 0.0041
+  (mostly ~3e-6 = fp16 rounding) in a localized 17x32 block; 23 later runs,
+  including 6 under concurrent verify_ep/verify_plugin GPU load, were
+  bit-identical. The devop dump/dispatch was identical, and rebuilding the
+  same source reproduced the majority result, so this is NOT a regression
+  from the P1 fixes. It matches the unverified "races" item in REVIEW.md —
+  treat a future occurrence as a real GPU-side race and capture the frame
+  plus a counter pass rather than dismissing it.
 - Actual resident waves/SIMD for winograd_conv (rocprofv2) — 3 predicted
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
 - Why did vs_ab_check segfault intermittently at teardown in 4-backend

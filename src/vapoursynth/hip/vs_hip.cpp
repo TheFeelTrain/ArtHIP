@@ -89,11 +89,32 @@ static const VSFrame* VS_CC hipGetFrame(
   const int in_w = vsapi->getFrameWidth(src, 0);
   const int in_h = vsapi->getFrameHeight(src, 0);
 
+  // Every plane is read with the luma width/height, so a subsampled frame and
+  // a channel count the model does not expect must be refused here rather than
+  // read out of bounds. Creation already validates the static format; this
+  // covers variable-format clips whose format may change between frames.
+  for (int p = 1; p < fmt->numPlanes; ++p) {
+    if (vsapi->getFrameWidth(src, p) != in_w || vsapi->getFrameHeight(src, p) != in_h) {
+      vsapi->setFilterError(
+          vs_error("subsampled input frame: every plane must have the luma plane's dimensions").c_str(),
+          frameCtx);
+      vsapi->freeFrame(src);
+      return nullptr;
+    }
+  }
+  const int in_c = fmt->numPlanes;
+  if (in_c != d->input_channels || in_c > 3) {
+    vsapi->setFilterError(vs_error("input clip plane count does not match the model's input channels")
+                              .c_str(),
+                          frameCtx);
+    vsapi->freeFrame(src);
+    return nullptr;
+  }
+
   // Round-robin over the engine pool; each engine serializes internally.
   vship::HipEngine* eng =
       d->engines[d->next_engine.fetch_add(1) % static_cast<int>(d->engines.size())];
 
-  const int in_c = (fmt->numPlanes > 1) ? fmt->numPlanes : d->input_channels;
   std::vector<int64_t> in_shape{1, in_c, in_h, in_w};
   std::vector<int64_t> out_shape;
   if (!eng->GetOutputShape(in_shape, out_shape) || out_shape.size() != 4) {
@@ -125,9 +146,8 @@ static const VSFrame* VS_CC hipGetFrame(
   const uint8_t* src_ptrs[3] = {nullptr, nullptr, nullptr};
   ptrdiff_t src_strides[3] = {0, 0, 0};
   for (int p = 0; p < in_c && p < 3; ++p) {
-    const int pi = (fmt->numPlanes > 1) ? p : 0;
-    src_ptrs[p] = vsapi->getReadPtr(src, pi);
-    src_strides[p] = vsapi->getStride(src, pi);
+    src_ptrs[p] = vsapi->getReadPtr(src, p);
+    src_strides[p] = vsapi->getStride(src, p);
   }
   switch (fmt->sampleType) {
     case stInteger: {
@@ -400,6 +420,14 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
     fail("expects 8/16-bit int or fp16/fp32 float input");
     return;
   }
+  // The engine feeds every model channel from a full-resolution plane and
+  // packs each plane with the luma width/height. There is no resampling path,
+  // so subsampled chroma (YUV420/YUV422) and a plane count that disagrees with
+  // the model would read past the plane.
+  if (fmt.subSamplingW != 0 || fmt.subSamplingH != 0) {
+    fail("subsampled input (YUV420/YUV422) is not supported; convert to 4:4:4 first");
+    return;
+  }
 
   try {
   std::vector<int64_t> probe_in{1, 1, 64, 64};
@@ -441,23 +469,32 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
       fail(error);
       return;
     }
-    if (!e->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4) {
-      delete e;
-      fail("model shape probe failed");
-      return;
-    }
     d->engines.push_back(e);
   }
-  d->output_fp32 = !d->engines.empty() && d->engines[0]->OutputIsFp32();
-  if (!d->engines.empty()) {
-    d->input_channels = d->engines[0]->InputChannels();
-    d->output_channels = d->engines[0]->OutputChannels();
-    if (d->input_channels < 1) d->input_channels = 1;
-    if (d->output_channels < 1) d->output_channels = 1;
+  d->output_channels = d->engines[0]->OutputChannels();
+  if (d->output_channels < 1) d->output_channels = 1;
+  d->output_fp32 = d->engines[0]->OutputIsFp32();
+  d->input_channels = d->engines[0]->InputChannels();
+  if (d->input_channels < 1) d->input_channels = 1;
+
+  // A clip has at most three planes, every plane must be full resolution (no
+  // resampling path exists), and the engine packs each plane with the luma
+  // width/height. So the plane count must equal the model's input channels.
+  if (d->input_channels > 3) {
+    fail("model requires " + std::to_string(d->input_channels) +
+         " input channels, but a clip provides at most 3 full-resolution planes");
+    return;
   }
+  if (fmt.numPlanes != d->input_channels) {
+    fail("clip has " + std::to_string(fmt.numPlanes) + " plane(s) but the model expects " +
+         std::to_string(d->input_channels) + " input channel(s)");
+    return;
+  }
+
+  // Probe with the real channel count: shape propagation checks that each
+  // conv's weight channels agree with its activation.
   probe_in[1] = d->input_channels;
-  if (!d->engines.empty() &&
-      (!d->engines[0]->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4)) {
+  if (!d->engines[0]->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4) {
     fail("model shape probe failed");
     return;
   }

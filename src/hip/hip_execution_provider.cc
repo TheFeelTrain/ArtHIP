@@ -139,7 +139,11 @@ HipExecutionProvider::HipExecutionProvider(const HipExecutionProviderInfo& info)
     : IExecutionProvider(onnxruntime::kHipExecutionProvider, OrtDevice()), info_(info) {
   InitProviderOrtApi();
   context_ = std::make_shared<hip::HipContext>();
-  if (!context_->Initialize()) {
+  // Wire the configured device into the context and refuse capabilities if the
+  // context could not be created: a null context must never be dereferenced.
+  if (!context_->Initialize(info_.device_id)) {
+    fprintf(stderr, "[hip] context initialization failed for device %d; HIP EP disabled\n",
+            info_.device_id);
     context_ = nullptr;
   }
 }
@@ -152,6 +156,12 @@ HipExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer
                                     const GraphOptimizerRegistry& /*graph_optimizer_registry*/,
                                     IResourceAccountant* /*resource_accountant*/) const {
   std::vector<std::unique_ptr<ComputeCapability>> result;
+
+  // Without a usable context the EP cannot execute anything; claiming nodes
+  // would only move work from a working provider onto a broken one.
+  if (!context_ || !context_->initialized()) {
+    return result;
+  }
 
   const auto& nodes_in_order = graph_viewer.GetNodesInTopologicalOrder();
   if (nodes_in_order.empty()) {
@@ -226,6 +236,11 @@ HipExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer
 
 common::Status HipExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
                                              std::vector<NodeComputeInfo>& node_compute_funcs) {
+  if (!context_ || !context_->initialized()) {
+    return Status(common::ONNXRUNTIME, common::FAIL,
+                  "HIP EP: device context is not initialized (device " +
+                      std::to_string(info_.device_id) + ")");
+  }
   for (const auto& fused_node_graph : fused_nodes_and_graphs) {
     const GraphViewer& graph_body_viewer = fused_node_graph.filtered_graph;
 

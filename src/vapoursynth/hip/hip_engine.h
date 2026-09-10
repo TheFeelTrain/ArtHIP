@@ -128,6 +128,9 @@ class HipEngine {
                        std::unordered_map<std::string, std::vector<int64_t>>& shapes) const;
   bool EnsureBuilt(const std::vector<int64_t>& input_shape, std::string& error);
   void DestroyDeviceState();
+  // HIP's current device is thread-local; VapourSynth calls Run()/EnsureBuilt()
+  // from worker threads, so every entry point re-selects device_id_.
+  bool SetDevice(std::string& error) const;
 
   int device_id_ = 0;
   void* stream_ = nullptr;
