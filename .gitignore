@@ -4,5 +4,10 @@ tmp/
 
 .mxr_cache/
 
+# Python test tooling
+__pycache__/
+*.py[co]
+.pytest_cache/
+
 ArtCNN_R8F64_fp16*.png
 .dsh-managed-access.json

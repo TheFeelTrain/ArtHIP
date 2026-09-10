@@ -432,6 +432,13 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         error = "Conv weight '" + op.in1 + "' has a non-positive channel count";
         return false;
       }
+      // The kernels cover at most 64 output channels: direct_conv writes co in
+      // [0,56]+8 and winograd's four wave32s own exactly four 16-ko k-blocks.
+      // Reject here so the failure precedes any buffer allocation or launch.
+      if (wdims[0] > 64) {
+        error = "conv supports at most 64 output channels (got " + std::to_string(wdims[0]) + ")";
+        return false;
+      }
       const int wdtype = weights_[op.in1].dtype;
       if (wdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
           wdtype != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
@@ -859,9 +866,7 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
         const uint32_t C_blocks = C_pad / 16u;
         const int in_idx = tensor_map_[op.in0].buffer_index;
 
-        // The compact kernels cover at most 64 output channels: direct_conv
-        // writes co in [0,56]+8 and winograd's four wave32s own exactly four
-        // 16-ko k-blocks. Larger M would silently leave channels unwritten.
+        // (M <= 64 is enforced in Build; the assert below is a defensive guard.)
         if (M > 64u) {
           error = "conv supports at most 64 output channels (got " + std::to_string(M) + ")";
           return false;

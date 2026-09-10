@@ -34,10 +34,15 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
 All nine [P1] findings from REVIEW.md are fixed in the tree; P2/performance
 items are untouched and still open. The engine/EP now REJECT what they cannot
 compute correctly instead of reading out of bounds or silently under-writing.
-Verified with `tmp/p1_tests/` (29 checks, GPU): engine fixtures vs numpy, EP
-vs CPU, plugin via vspipe. Pre-fix A/B (`tmp/p1_tests/before`,
-`ep_before/libonnxruntime_providers_hip.so`, `plugin_before/libhip_before.so`)
-fails 10 of the same checks, so the tests demonstrate the bugs.
+Verified by the correctness suite (`tests/correctness/`, run with
+`python tests/correctness/run.py`): engine fixtures vs numpy references, EP vs
+the ONNX reference, plugin via vspipe — 62 checks + 1 strict xfail for the
+still-open EP multi-channel layout (P2-11). The same checks fail against
+pre-fix builds (10 of them), so they demonstrate the bugs rather than merely
+passing. The plugin suite also runs all three shipped models, including the
+chroma model (3 planes -> 2 chroma planes) whose U/V outputs are compared
+against an independent ORT-CPU run: correct pairing ~0.006, a swapped or
+shifted plane 1.0, so the chroma layout is gated.
 
 - **#1 subsampled/channel mismatch (vs_hip.cpp).** Creation rejects
   subSamplingW/H != 0 (no resampling path exists) and requires
