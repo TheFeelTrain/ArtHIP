@@ -1,4 +1,35 @@
-## ROADMAP — occupancy & latency (next working session)
+## CURRENT BEST — 2026-09-10: transposed v_lds SHIPPED (+19-20%)
+
+vs-mlrt's libvsmigx.so was updated (2026-09-10) and MIGX now does 19.3-19.7 fps
+on R8F64_Chroma @1080p (real jpbd source, `.scale(clip)` 1:1) vs HIP 18.6 — we
+were LOSING. Baseline paired 100f x3 (tmp/bench_pair.sh chroma): hip 18.72/
+18.68/18.58, migx 19.71/19.38/19.32. Base model: hip 18.43, migx 15.3 (MIGX
+base is slower because R8F64 is a 2x model, so the luma path also writes a 4x
+output + Catrom downscale; the two models are NOT equal-work — the fps "bug"
+the user saw is that extra output stage, not a MIGX conv win).
+
+FIX (KEPT): v_lds was c-major [wp][c][nt-stride20]; the WMMA B fragment needs a
+column (16 c at fixed nt), which the compiler lowered to 64 ds_load_u16_d16 per
+wpi. Transpose to [wp][nt][c-stride20] so each lane's 16 c are one contiguous,
+8-byte-aligned row: B is now 4x ds_load_b64 per matrix (conflict-free — rows
+40 B apart map nt=0..15 to 16 distinct even banks), 4x fewer LDS ops and 4x
+fewer V-store ops. MUST keep `#pragma unroll 1` on the wpi loop: without it the
+compiler fully unrolls and hoists all 16 A-fragments -> 192 VGPR + 160 scratch
+(that is exactly the previously-rejected "transposed v_lds" signature; the
+layout was never the problem, the unroll was). Pre-window hypothesis that the
+2-way fp16-packed nt conflict was the stall was WRONG in detail but right in
+direction: LDS *instruction* count was the stall, not bandwidth.
+
+Stats: winograd_conv VGPR 134 -> 135, SGPR 66, scratch 0 (both). LDS unchanged
+10 KB. Paired 100f x3 after change:
+  chroma: hip 22.61/22.28/22.35  migx 19.52/19.43/19.40  (+15% over MIGX)
+  base:   hip 22.06/22.00/21.92  migx 14.92/15.12/15.05  (+46% over MIGX)
+Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
+  chroma 1920x1080 random: max 0.0117 (all planes), 0% px > 0.02 — identical
+  class to the pre-change 0.0117/0.0112. base on real jpbd frame 0: luma max
+  0.00097, 0% > 0.02; U/V bit-identical (Catrom path, model not involved).
+
+
 
 Kernel is LATENCY-bound: 4.4 ms/conv vs 0.56 ms DRAM floor and 0.6 ms MMA
 floor (68 GFLOP @ ~15 TFLOPS of ~113 peak). Compute util ~13%. Everything
@@ -32,6 +63,8 @@ R2. Transposed v_lds [wp][nt][c] (pad 16, i.e. 512 B per wp-row block):
     row pitch were never confirmed by counter data — retry only WITH
     rocprofv2 LDS-conflict metrics, and consider smaller pads / swizzled
     XOR layouts. Do AFTER R1 (fewer things live during swap).
+    ==> DONE 2026-09-10 (stride 20, 4x b64/lane): the 5.8 fps was the wpi
+    loop unrolling, not the layout. `#pragma unroll 1` -> +19-20%. Top of file.
 R3. Cross-cb A prefetch: issue cb+1 group-0 A loads just before current
     cb's WMMA drain (global ~400-800 cyc hides under WMMA). Costs ~32 live
     regs across the loop boundary — evaluate only after R1 lands (regs
@@ -83,6 +116,7 @@ FAILED / REVERTED (do not blind-retry):
   fixed at that point). Cause unconfirmed (bank model said mild); retry
   needs rocprof conflict counters. (The separate VULKAN transposed attempt
   was never benchmarked — it produced zeros and was abandoned.)
+  ==> RETRIED AND SHIPPED 2026-09-10; real cause was wpi-loop unroll, see top.
 - Direct writeback + DTS tail fusion, first attempt: crash/garbage stack
   (consecutive-write scatter bug, missing blocksize carry, probe leftovers
   disabling cast + all launches). Fully reverted to staged writeback.
@@ -220,6 +254,9 @@ REJECTED (do not retry without new evidence):
   A-frag sets blew the register budget. Layout idea is sound, register cost
   is not — retry only with a leaner schedule (recompute pointers per wpi,
   stream A per-group). REVERTED.
+  ==> RESOLVED 2026-09-10, NOW SHIPPED: the register blowup was wpi-loop
+  unrolling (all 16 A-fragments hoisted), not the layout. `#pragma unroll 1`
+  on the wpi loop -> VGPR 135, no spills, +19-20%. See CURRENT BEST at top.
 - A-fragment pre-staging across wpi (2026-09-06): same failure signature
   (192 VGPR + spills, 5 fps). 16 extra live half16 across the wpi loop does
   not fit. REVERTED.
@@ -299,9 +336,26 @@ NEXT (not tried, in priority order):
 4. Lock clocks for benchmarking (rocm-smi --setperflevel high); all numbers
    above at sustained 2245MHz but the card idles at 130MHz between runs.
 
-## Multi-channel models (2026-09-06, chroma R8F64 WIP — NOT SHIPPED)
+## Multi-channel models (2026-09-06: chroma SHIPPED, dehalo SHIPPED)
 
-RESOLVED 2026-09-06: chroma was NEVER broken in the engine. HIP-vs-MIGX via
+DEHALO 3ch->3ch (ArtCNN_R8F64_YCbCr_DEHALO.onnx @ workspace root, 2026-09-06):
+engine needed NO changes (27 Conv + SiLU + Adds, tail Clip, C=3 in/out —
+all already supported; tail weight [3,64,3,3] exercises the M<16
+vector-tail writeback path). Pure PLUGIN gaps, fixed in vs_hip.cpp:
++ accept cmRGB input clips (was: gray/YUV only -> hard error on RGBS).
++ out_c==3 non-flex declares + writes a 3-plane RGB frame (mirrors vsmigx
+  setDimensions: C==3 non-flex -> cmRGB; C==1-or-flex -> gray). Each output
+  channel goes to its own plane; flex path untouched.
+Accuracy vs MIGX GenericOnnxScaler on identical random RGBS (limiter-only
+preprocess both sides): 64px maxdiff 0.0039/0.0032/0.0029, 320x180 maxdiff
+0.0034/0.0044/0.0039, 0% px >0.02 all planes — BETTER than luma class.
+Luma bit-identical pre/post change (acc_dump self-check maxdiff 0.0).
+NOTE: model resolves relative to the VS host cwd (vsscale resolves its own
+models); pass an absolute path to hip.Model for workspace-root models.
+(The first "frame not of declared format" crash was mine: GetFrame wrote RGB
+while hipInit still declared gray — both sides now share the out_c==3 rule.)
+
+CHROMA RESOLVED 2026-09-06: chroma was NEVER broken in the engine. HIP-vs-MIGX via
 vsscale on identical random YUV444PS: 64x64 (U maxdiff 0.005/V 0.008),
 320x180 (U 0.0095/V 0.0088, 0% px >0.02), 1080p random (U 0.0117/V 0.0112,
 0% px >0.02) — fp16-rounding class plus tail-Clip saturation divergence,

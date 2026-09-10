@@ -101,9 +101,17 @@ static const VSFrameRef* VS_CC hipGetFrame(
   const int out_h = static_cast<int>(out_shape[2]);
   const int out_c = static_cast<int>(out_shape[1]);
 
-  const VSFormat* out_fmt = d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
-                                : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
-                                                 : vsapi->getFormatPreset(pfGray16, core);
+  // 3-channel non-flexible output (e.g. 3ch->3ch models like the DEHALO
+  // net): emit a 3-plane RGB frame like vsmigx does (setDimensions maps
+  // C==3 non-flex to cmRGB). Otherwise single-plane gray.
+  const bool rgb_out = (out_c == 3 && d->flexible_prop.empty());
+  const VSFormat* out_fmt = rgb_out
+      ? vsapi->registerFormat(cmRGB,
+                              (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
+                              d->output_fp32 ? 32 : 16, 0, 0, core)
+      : d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
+      : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
+                       : vsapi->getFormatPreset(pfGray16, core);
   dst = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
 
   // Pack the source frame into a contiguous host buffer. fp32 clips on
@@ -221,16 +229,38 @@ static const VSFrameRef* VS_CC hipGetFrame(
 
   // Writeback: plane 0 to the frame; with flexible_output_prop, planes
   // 0..C-1 also stashed as MlrtFlexibleN frame props (+ num_planes), matching
-  // the vsmigx flexible protocol for PropToClip splitting.
+  // the vsmigx flexible protocol for PropToClip splitting. A 3-plane RGB
+  // frame (out_c==3, non-flex) gets one output channel per plane.
   const bool want_map = !d->flexible_prop.empty();
   const bool flex = want_map && out_c > 1;
+  const bool rgb_planes = rgb_out && out_c == 3;
   const size_t plane_px = static_cast<size_t>(out_w) * out_h;
+  auto write_plane_f32 = [&](int plane, const float* src_base) {
+    uint8_t* pptr = vsapi->getWritePtr(dst, plane);
+    const ptrdiff_t pstride = vsapi->getStride(dst, plane);
+    for (int y = 0; y < out_h; ++y) {
+      float* row = reinterpret_cast<float*>(pptr + y * pstride);
+      std::memcpy(row, src_base + static_cast<size_t>(y) * out_w, static_cast<size_t>(out_w) * 4);
+    }
+  };
+  auto write_plane_f16 = [&](int plane, const uint16_t* src_base) {
+    uint8_t* pptr = vsapi->getWritePtr(dst, plane);
+    const ptrdiff_t pstride = vsapi->getStride(dst, plane);
+    for (int y = 0; y < out_h; ++y) {
+      uint16_t* row = reinterpret_cast<uint16_t*>(pptr + y * pstride);
+      std::memcpy(row, src_base + static_cast<size_t>(y) * out_w, static_cast<size_t>(out_w) * 2);
+    }
+  };
   uint8_t* dst_ptr = vsapi->getWritePtr(dst, 0);
   const ptrdiff_t dst_stride = vsapi->getStride(dst, 0);
   if (d->output_fp32) {
     for (int y = 0; y < out_h; ++y) {
       float* row = reinterpret_cast<float*>(dst_ptr + y * dst_stride);
       std::memcpy(row, &out_f32[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 4);
+    }
+    if (rgb_planes) {
+      for (int c = 1; c < 3; ++c)
+        write_plane_f32(c, &out_f32[static_cast<size_t>(c) * plane_px]);
     }
     if (want_map) {
       VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
@@ -260,6 +290,10 @@ static const VSFrameRef* VS_CC hipGetFrame(
     for (int y = 0; y < out_h; ++y) {
       uint16_t* row = reinterpret_cast<uint16_t*>(dst_ptr + y * dst_stride);
       std::memcpy(row, &out_fp16[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 2);
+    }
+    if (rgb_planes) {
+      for (int c = 1; c < 3; ++c)
+        write_plane_f16(c, &out_fp16[static_cast<size_t>(c) * plane_px]);
     }
     if (want_map) {
       VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
@@ -394,9 +428,19 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
   VSVideoInfo out_vi = *d->vi;
   out_vi.width = in_w * scale_w;
   out_vi.height = in_h * scale_h;
-  out_vi.format = d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
-                : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
-                                 : vsapi->getFormatPreset(pfGray16, core);
+  // Mirror the GetFrame rule: 3-channel non-flex output is RGB (vsmigx
+  // setDimensions maps C==3 non-flex to cmRGB).
+  const int decl_out_c = static_cast<int>(probe_out[1]);
+  const bool decl_flex = !d->flexible_prop.empty();
+  if (decl_out_c == 3 && !decl_flex) {
+    out_vi.format = vsapi->registerFormat(cmRGB,
+                                          (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
+                                          d->output_fp32 ? 32 : 16, 0, 0, core);
+  } else {
+    out_vi.format = d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
+                  : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
+                                   : vsapi->getFormatPreset(pfGray16, core);
+  }
   vsapi->setVideoInfo(&out_vi, 1, node);
   } catch (const std::exception& e) {
     vsapi->setError(out, vs_error(std::string("exception: ") + e.what()).c_str());
@@ -438,11 +482,11 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
     if (fp) d->flexible_prop = fp;
   }
 
-  // 8/16-bit int or fp16/fp32 float, gray or YUV (multi-plane clips feed
-  // multi-channel models, e.g. chroma ArtCNN).
+  // 8/16-bit int or fp16/fp32 float, gray, YUV (multi-plane clips feed
+  // multi-channel models, e.g. chroma ArtCNN) or RGB (3ch->3ch models).
   const auto* fmt = d->vi->format;
-  if (!fmt || (fmt->colorFamily != cmGray && fmt->colorFamily != cmYUV)) {
-    set_error("expects a gray or YUV clip");
+  if (!fmt || (fmt->colorFamily != cmGray && fmt->colorFamily != cmYUV && fmt->colorFamily != cmRGB)) {
+    set_error("expects a gray, YUV or RGB clip");
     delete d;
     return;
   }

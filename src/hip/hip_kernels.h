@@ -67,6 +67,20 @@ __device__ __forceinline__ void winograd_in4_v4(const half4_t* d, half4_t* v)
   v[12] = t4 - t12;  v[13] = t5 - t13;  v[14] = t6 - t14;  v[15] = t7 - t15;
 }
 
+// Load a lane's half16 B-fragment from the transposed V store: the 16 halfs
+// are contiguous (c-major within the row), so this is 4x ds_load_b64 instead
+// of 16 scalar u16 gathers. Caller guarantees 8-byte alignment (row stride 20
+// halfs = 40 B, plus a 16-byte-aligned base).
+__device__ __forceinline__ half16_t lds_v16(const _Float16* p)
+{
+  union { half16_t v; half4_t q[4]; } u;
+  u.q[0] = *reinterpret_cast<const half4_t*>(p + 0);
+  u.q[1] = *reinterpret_cast<const half4_t*>(p + 4);
+  u.q[2] = *reinterpret_cast<const half4_t*>(p + 8);
+  u.q[3] = *reinterpret_cast<const half4_t*>(p + 12);
+  return u.v;
+}
+
 __device__ __forceinline__ void winograd_in4(const _Float16* d, _Float16* v)
 {
   float t[16];
@@ -120,7 +134,11 @@ __global__ void winograd_conv(
   const uint c_blocks = Cblocks;
 
   __shared__ _Float16 strip4[6 * 18 * 16];
-  __shared__ _Float16 v_lds[16 * 16 * 20];
+  // Transposed V store: [wp][nt][c] with c-row stride 20 (c=0..15 used, 4 pad).
+  // Row starts are 40 B apart => 8-byte aligned, so each lane's 16-c fragment
+  // is 4x ds_load_b64 (aligned) instead of 16 scalar u16 gathers. 16-byte base
+  // alignment is asserted so the pair-loads never straddle a bank-quad edge.
+  __shared__ __attribute__((aligned(16))) _Float16 v_lds[16 * 16 * 20];
 
   float8_t y00 = {}, y01 = {}, y10 = {}, y11 = {};
 
@@ -175,10 +193,11 @@ __global__ void winograd_conv(
           }
         half4_t v4[16];
         winograd_in4_v4(d4, v4);
-        for (uint wp = 0u; wp < 16u; ++wp) {
-          for (uint cc = 0u; cc < 4u; ++cc)
-            v_lds[wp * 320u + (c4 + cc) * 20u + nt_local] = v4[wp][cc];
-        }
+        // Store the 16 wp values as 16 x 8-byte LDS writes (c4..c4+3 are
+        // contiguous in the transposed [wp][nt][c] layout) instead of 64
+        // scalar u16 stores.
+        for (uint wp = 0u; wp < 16u; ++wp)
+          *reinterpret_cast<half4_t*>(v_lds + wp * 320u + nt_local * 20u + c4) = v4[wp];
       }
     }
     __syncthreads();  // v_lds ready
@@ -186,6 +205,7 @@ __global__ void winograd_conv(
     // ---- WMMA: 4 wp groups, A from U (this wave's k-block), B from v_lds ----
     // A: lane l holds U[ko=l%16][c=0..15] for (kblock=kgroup, wp, cb)
     const uint ub = kgroup * (c_blocks * 4096u) + cb_off * 4u;
+#pragma unroll 1
     for (uint wpi = 0u; wpi < 4u; ++wpi) {
       half16_t a0, a1, a2, a3;
       {
@@ -197,16 +217,16 @@ __global__ void winograd_conv(
         a2 = *reinterpret_cast<const half16_t*>(u + abase + 2u * 256u);
         a3 = *reinterpret_cast<const half16_t*>(u + abase + 3u * 256u);
       }
-      // B fragments: lane l holds V[wp][c=0..15][nt=l%16]
+      // B fragments: lane l holds V[wp][c=0..15][nt=l%16]. Transposed store
+      // makes those 16 c values one contiguous row -> 4 aligned b64 LDS reads
+      // per matrix (conflict-free: nt*40 B rows map to distinct bank-quads).
       half16_t b0, b1, b2, b3;
       {
-        const uint nt = lane % 16u;
-        for (int e = 0; e < 16; ++e) {
-          b0[e] = v_lds[(wpi * 4u + 0u) * 320u + e * 20u + nt];
-          b1[e] = v_lds[(wpi * 4u + 1u) * 320u + e * 20u + nt];
-          b2[e] = v_lds[(wpi * 4u + 2u) * 320u + e * 20u + nt];
-          b3[e] = v_lds[(wpi * 4u + 3u) * 320u + e * 20u + nt];
-        }
+        const uint bnt = (lane % 16u) * 20u;
+        b0 = lds_v16(v_lds + (wpi * 4u + 0u) * 320u + bnt);
+        b1 = lds_v16(v_lds + (wpi * 4u + 1u) * 320u + bnt);
+        b2 = lds_v16(v_lds + (wpi * 4u + 2u) * 320u + bnt);
+        b3 = lds_v16(v_lds + (wpi * 4u + 3u) * 320u + bnt);
       }
       float8_t m0 = {}, m1 = {}, m2 = {}, m3 = {};
       wmma_mul(a0, b0, m0);
