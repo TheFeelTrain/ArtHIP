@@ -15,9 +15,14 @@
 //   - fp16=true (default) converts fp32 models to fp16 at load time
 //   - num_streams engines run round-robin so concurrent frame requests
 //     overlap (fmParallel-safe; each engine owns its stream + mutex)
+//
+// VapourSynth API4 (VapourSynthPluginInit2 / createVideoFilter). The model is
+// loaded, probed and the output VSVideoInfo resolved in hipCreate (the API4
+// filter-creation callback); API3's separate filter-init callback no longer
+// exists.
 
-#include <VapourSynth.h>
-#include <VSHelper.h>
+#include <VapourSynth4.h>
+#include <VSHelper4.h>
 
 #include <atomic>
 #include <cstdint>
@@ -38,8 +43,6 @@
 #include "../common/onnx_utils.h"
 #include "hip_engine.h"
 
-static const VSPlugin* myself = nullptr;
-
 struct HipData {
   std::vector<vship::HipEngine*> engines;
   std::atomic<int> next_engine{0};
@@ -52,7 +55,8 @@ struct HipData {
   int output_channels = 1;
   std::string flexible_prop;
   const VSVideoInfo* vi = nullptr;
-  VSNodeRef* node = nullptr;
+  VSVideoInfo out_vi{};
+  VSNode* node = nullptr;
 };
 
 static std::string vs_error(const std::string& what) {
@@ -63,10 +67,10 @@ static std::string vs_error(const std::string& what) {
 // Frame processing
 // ---------------------------------------------------------------------------
 
-static const VSFrameRef* VS_CC hipGetFrame(
-    int n, int activationReason, void** instanceData, void** frameData,
-    VSFrameContext* frameCtx, VSCore* core, const VSAPI* vsapi) {
-  auto* d = static_cast<HipData*>(*instanceData);
+static const VSFrame* VS_CC hipGetFrame(
+    int n, int activationReason, void* instanceData, void** frameData,
+    VSFrameContext* frameCtx, VSCore* core, const VSAPI* vsapi) noexcept {
+  auto* d = static_cast<HipData*>(instanceData);
   if (activationReason == arInitial) {
     vsapi->requestFrameFilter(n, d->node, frameCtx);
     return nullptr;
@@ -75,13 +79,13 @@ static const VSFrameRef* VS_CC hipGetFrame(
     return nullptr;
   }
 
-  const VSFrameRef* src = vsapi->getFrameFilter(n, d->node, frameCtx);
+  const VSFrame* src = vsapi->getFrameFilter(n, d->node, frameCtx);
   if (!src) {
     return nullptr;
   }
-  VSFrameRef* dst = nullptr;
+  VSFrame* dst = nullptr;
   try {
-  const auto* fmt = vsapi->getFrameFormat(src);
+  const VSVideoFormat* fmt = vsapi->getVideoFrameFormat(src);
   const int in_w = vsapi->getFrameWidth(src, 0);
   const int in_h = vsapi->getFrameHeight(src, 0);
 
@@ -103,16 +107,14 @@ static const VSFrameRef* VS_CC hipGetFrame(
 
   // 3-channel non-flexible output (e.g. 3ch->3ch models like the DEHALO
   // net): emit a 3-plane RGB frame like vsmigx does (setDimensions maps
-  // C==3 non-flex to cmRGB). Otherwise single-plane gray.
+  // C==3 non-flex to cfRGB). Otherwise single-plane gray.
   const bool rgb_out = (out_c == 3 && d->flexible_prop.empty());
-  const VSFormat* out_fmt = rgb_out
-      ? vsapi->registerFormat(cmRGB,
-                              (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
-                              d->output_fp32 ? 32 : 16, 0, 0, core)
-      : d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
-      : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
-                       : vsapi->getFormatPreset(pfGray16, core);
-  dst = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+  VSVideoFormat out_fmt{};
+  vsapi->queryVideoFormat(&out_fmt,
+                          rgb_out ? cfRGB : cfGray,
+                          (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
+                          d->output_fp32 ? 32 : 16, 0, 0, core);
+  dst = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
 
   // Pack the source frame into a contiguous host buffer. fp32 clips on
   // fp32-input models pass through raw; everything else becomes fp16 [0,1].
@@ -263,19 +265,19 @@ static const VSFrameRef* VS_CC hipGetFrame(
         write_plane_f32(c, &out_f32[static_cast<size_t>(c) * plane_px]);
     }
     if (want_map) {
-      VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      VSFrame* p0 = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
       uint8_t* p0ptr = vsapi->getWritePtr(p0, 0);
       const ptrdiff_t p0stride = vsapi->getStride(p0, 0);
       for (int y = 0; y < out_h; ++y) {
         float* row = reinterpret_cast<float*>(p0ptr + y * p0stride);
         std::memcpy(row, &out_f32[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 4);
       }
-      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + "0").c_str(), p0, paReplace);
+      vsapi->mapSetFrame(vsapi->getFramePropertiesRW(dst), (d->flexible_prop + "0").c_str(), p0, maReplace);
       vsapi->freeFrame(p0);
-      vsapi->propSetInt(vsapi->getFramePropsRW(dst), "num_planes", out_c, paReplace);
+      vsapi->mapSetInt(vsapi->getFramePropertiesRW(dst), "num_planes", out_c, maReplace);
     }
     for (int c = 1; flex && c < out_c; ++c) {
-      VSFrameRef* pf = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      VSFrame* pf = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
       uint8_t* pptr = vsapi->getWritePtr(pf, 0);
       const ptrdiff_t pstride = vsapi->getStride(pf, 0);
       for (int y = 0; y < out_h; ++y) {
@@ -283,7 +285,7 @@ static const VSFrameRef* VS_CC hipGetFrame(
         std::memcpy(row, &out_f32[static_cast<size_t>(c) * plane_px + static_cast<size_t>(y) * out_w],
                     static_cast<size_t>(out_w) * 4);
       }
-      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, paReplace);
+      vsapi->mapSetFrame(vsapi->getFramePropertiesRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, maReplace);
       vsapi->freeFrame(pf);
     }
   } else if (d->output_fp16) {
@@ -296,19 +298,19 @@ static const VSFrameRef* VS_CC hipGetFrame(
         write_plane_f16(c, &out_fp16[static_cast<size_t>(c) * plane_px]);
     }
     if (want_map) {
-      VSFrameRef* p0 = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      VSFrame* p0 = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
       uint8_t* p0ptr = vsapi->getWritePtr(p0, 0);
       const ptrdiff_t p0stride = vsapi->getStride(p0, 0);
       for (int y = 0; y < out_h; ++y) {
         uint16_t* row = reinterpret_cast<uint16_t*>(p0ptr + y * p0stride);
         std::memcpy(row, &out_fp16[static_cast<size_t>(y) * out_w], static_cast<size_t>(out_w) * 2);
       }
-      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + "0").c_str(), p0, paReplace);
+      vsapi->mapSetFrame(vsapi->getFramePropertiesRW(dst), (d->flexible_prop + "0").c_str(), p0, maReplace);
       vsapi->freeFrame(p0);
-      vsapi->propSetInt(vsapi->getFramePropsRW(dst), "num_planes", out_c, paReplace);
+      vsapi->mapSetInt(vsapi->getFramePropertiesRW(dst), "num_planes", out_c, maReplace);
     }
     for (int c = 1; flex && c < out_c; ++c) {
-      VSFrameRef* pf = vsapi->newVideoFrame(out_fmt, out_w, out_h, src, core);
+      VSFrame* pf = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
       uint8_t* pptr = vsapi->getWritePtr(pf, 0);
       const ptrdiff_t pstride = vsapi->getStride(pf, 0);
       for (int y = 0; y < out_h; ++y) {
@@ -316,7 +318,7 @@ static const VSFrameRef* VS_CC hipGetFrame(
         std::memcpy(row, &out_fp16[static_cast<size_t>(c) * plane_px + static_cast<size_t>(y) * out_w],
                     static_cast<size_t>(out_w) * 2);
       }
-      vsapi->propSetFrame(vsapi->getFramePropsRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, paReplace);
+      vsapi->mapSetFrame(vsapi->getFramePropertiesRW(dst), (d->flexible_prop + std::to_string(c)).c_str(), pf, maReplace);
       vsapi->freeFrame(pf);
     }
   } else {
@@ -344,32 +346,74 @@ static const VSFrameRef* VS_CC hipGetFrame(
   }
 }
 
+static void VS_CC hipFree(void* instanceData, VSCore* core, const VSAPI* vsapi) noexcept {
+  auto* d = static_cast<HipData*>(instanceData);
+  if (d) {
+    vsapi->freeNode(d->node);
+    for (auto* e : d->engines) delete e;
+    delete d;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Filter creation
+// Filter creation (API4: model load + shape probe + output vi all happen here,
+// because createVideoFilter needs the resolved VSVideoInfo up front).
 // ---------------------------------------------------------------------------
 
-static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* node,
-                          VSCore* core, const VSAPI* vsapi) {
-  auto* d = static_cast<HipData*>(*instanceData);
+static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore* core,
+                            const VSAPI* vsapi) noexcept {
+  auto set_error = [&](const std::string& msg) {
+    vsapi->mapSetError(out, vs_error(msg).c_str());
+  };
+
+  const int num_clips = vsapi->mapNumElements(in, "clips");
+  if (num_clips != 1) {
+    set_error("expects exactly 1 input clip");
+    return;
+  }
+  auto* d = new HipData;
+  d->node = vsapi->mapGetNode(in, "clips", 0, nullptr);
+  d->vi = vsapi->getVideoInfo(d->node);
+  int ferr = 0;
+  if (vsapi->mapNumElements(in, "flexible_output_prop") > 0) {
+    const char* fp = vsapi->mapGetData(in, "flexible_output_prop", 0, &ferr);
+    if (fp) d->flexible_prop = fp;
+  }
+
+  auto fail = [&](const std::string& msg) {
+    set_error(msg);
+    vsapi->freeNode(d->node);
+    for (auto* e : d->engines) delete e;
+    delete d;
+  };
+
+  // 8/16-bit int or fp16/fp32 float, gray, YUV (multi-plane clips feed
+  // multi-channel models, e.g. chroma ArtCNN) or RGB (3ch->3ch models).
+  // cfUndefined (variable-format clip) is rejected here too.
+  const VSVideoFormat& fmt = d->vi->format;
+  if (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB) {
+    fail("expects a gray, YUV or RGB clip");
+    return;
+  }
+  if (!((fmt.sampleType == stInteger && (fmt.bitsPerSample == 8 || fmt.bitsPerSample == 16)) ||
+        (fmt.sampleType == stFloat && (fmt.bitsPerSample == 16 || fmt.bitsPerSample == 32)))) {
+    fail("expects 8/16-bit int or fp16/fp32 float input");
+    return;
+  }
+
   try {
   std::vector<int64_t> probe_in{1, 1, 64, 64};
   std::vector<int64_t> probe_out;
   int err = 0;
-  const std::string network_path = vsapi->propGetData(in, "network_path", 0, &err);
-  d->device_id = static_cast<int>(vsapi->propGetInt(in, "device_id", 0, &err));
-  d->num_streams = static_cast<int>(vsapi->propGetInt(in, "num_streams", 0, &err));
+  const std::string network_path = vsapi->mapGetData(in, "network_path", 0, &err);
+  d->device_id = vsapi->mapGetIntSaturated(in, "device_id", 0, &err);
+  d->num_streams = vsapi->mapGetIntSaturated(in, "num_streams", 0, &err);
   if (d->num_streams < 1) d->num_streams = 1;
-  d->output_fp16 = !!vsapi->propGetInt(in, "fp16", 0, &err);
-
-  auto set_error = [&](const std::string& msg) {
-    vsapi->setError(out, vs_error(msg).c_str());
-    delete d;
-    *instanceData = nullptr;
-  };
+  d->output_fp16 = !!vsapi->mapGetIntSaturated(in, "fp16", 0, &err);
 
   auto load_result = loadONNX(network_path, 0, 0, false);
   if (std::holds_alternative<std::string>(load_result)) {
-    set_error(std::get<std::string>(load_result));
+    fail(std::get<std::string>(load_result));
     return;
   }
   auto model = std::move(std::get<ONNX_NAMESPACE::ModelProto>(load_result));
@@ -381,8 +425,7 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
   // and an output Cast node, which the engine folds into a device-side
   // fp16 -> fp32 convert of the download. Compute is fp16 either way; only
   // the clip format differs (GRAYS for fp32 clips, GRAYH otherwise).
-  const bool clip_fp32 = d->vi->format && d->vi->format->sampleType == stFloat &&
-                         d->vi->format->bitsPerSample == 32;
+  const bool clip_fp32 = fmt.sampleType == stFloat && fmt.bitsPerSample == 32;
   if (d->output_fp16) {
     std::unordered_set<std::string> blacklist;
     convert_float_to_float16(model, /*force_fp16_initializers=*/true, blacklist,
@@ -395,14 +438,12 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
     std::string error;
     if (!e->Build(model, error)) {
       delete e;
-      for (auto* prev : d->engines) delete prev;
-      set_error(error);
+      fail(error);
       return;
     }
     if (!e->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4) {
       delete e;
-      for (auto* prev : d->engines) delete prev;
-      set_error("model shape probe failed");
+      fail("model shape probe failed");
       return;
     }
     d->engines.push_back(e);
@@ -417,7 +458,7 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
   probe_in[1] = d->input_channels;
   if (!d->engines.empty() &&
       (!d->engines[0]->GetOutputShape(probe_in, probe_out) || probe_out.size() != 4)) {
-    set_error("model shape probe failed");
+    fail("model shape probe failed");
     return;
   }
 
@@ -425,98 +466,32 @@ static void VS_CC hipInit(VSMap* in, VSMap* out, void** instanceData, VSNode* no
   const int in_h = d->vi->height;
   const int scale_w = static_cast<int>(probe_out[3] / probe_in[3]);
   const int scale_h = static_cast<int>(probe_out[2] / probe_in[2]);
-  VSVideoInfo out_vi = *d->vi;
-  out_vi.width = in_w * scale_w;
-  out_vi.height = in_h * scale_h;
+
   // Mirror the GetFrame rule: 3-channel non-flex output is RGB (vsmigx
-  // setDimensions maps C==3 non-flex to cmRGB).
+  // setDimensions maps C==3 non-flex to cfRGB).
   const int decl_out_c = static_cast<int>(probe_out[1]);
   const bool decl_flex = !d->flexible_prop.empty();
-  if (decl_out_c == 3 && !decl_flex) {
-    out_vi.format = vsapi->registerFormat(cmRGB,
-                                          (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
-                                          d->output_fp32 ? 32 : 16, 0, 0, core);
-  } else {
-    out_vi.format = d->output_fp32 ? vsapi->getFormatPreset(pfGrayS, core)
-                  : d->output_fp16 ? vsapi->getFormatPreset(pfGrayH, core)
-                                   : vsapi->getFormatPreset(pfGray16, core);
+  d->out_vi = *d->vi;
+  d->out_vi.width = in_w * scale_w;
+  d->out_vi.height = in_h * scale_h;
+  vsapi->queryVideoFormat(&d->out_vi.format,
+                          (decl_out_c == 3 && !decl_flex) ? cfRGB : cfGray,
+                          (d->output_fp32 || d->output_fp16) ? stFloat : stInteger,
+                          d->output_fp32 ? 32 : 16, 0, 0, core);
+
+  // Flexible protocol (matches vsmigx): the out map carries the filter node
+  // under "clip" (createVideoFilter appends it) plus num_planes.
+  if (decl_flex) {
+    vsapi->mapSetInt(out, "num_planes", d->output_channels > 0 ? d->output_channels : 1, maReplace);
   }
-  vsapi->setVideoInfo(&out_vi, 1, node);
+
+  VSFilterDependency dep{d->node, rpGeneral};
+  vsapi->createVideoFilter(out, "Model", &d->out_vi, hipGetFrame, hipFree, fmParallel,
+                           &dep, 1, d, core);
   } catch (const std::exception& e) {
-    vsapi->setError(out, vs_error(std::string("exception: ") + e.what()).c_str());
-    delete d;
-    *instanceData = nullptr;
+    fail(std::string("exception: ") + e.what());
   } catch (...) {
-    vsapi->setError(out, vs_error("unknown exception").c_str());
-    delete d;
-    *instanceData = nullptr;
-  }
-}
-
-static void VS_CC hipFree(void* instanceData, VSCore* core, const VSAPI* vsapi) {
-  auto* d = static_cast<HipData*>(instanceData);
-  if (d) {
-    vsapi->freeNode(d->node);
-    for (auto* e : d->engines) delete e;
-    delete d;
-  }
-}
-
-static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore* core,
-                            const VSAPI* vsapi) {
-  auto set_error = [&](const std::string& msg) {
-    vsapi->setError(out, vs_error(msg).c_str());
-  };
-
-  const int num_clips = vsapi->propNumElements(in, "clips");
-  if (num_clips != 1) {
-    set_error("expects exactly 1 input clip");
-    return;
-  }
-  auto* d = new HipData;
-  d->node = vsapi->propGetNode(in, "clips", 0, nullptr);
-  d->vi = vsapi->getVideoInfo(d->node);
-  int ferr = 0;
-  if (vsapi->propNumElements(in, "flexible_output_prop") > 0) {
-    const char* fp = vsapi->propGetData(in, "flexible_output_prop", 0, &ferr);
-    if (fp) d->flexible_prop = fp;
-  }
-
-  // 8/16-bit int or fp16/fp32 float, gray, YUV (multi-plane clips feed
-  // multi-channel models, e.g. chroma ArtCNN) or RGB (3ch->3ch models).
-  const auto* fmt = d->vi->format;
-  if (!fmt || (fmt->colorFamily != cmGray && fmt->colorFamily != cmYUV && fmt->colorFamily != cmRGB)) {
-    set_error("expects a gray, YUV or RGB clip");
-    delete d;
-    return;
-  }
-  if (!((fmt->sampleType == stInteger && (fmt->bitsPerSample == 8 || fmt->bitsPerSample == 16)) ||
-        (fmt->sampleType == stFloat && (fmt->bitsPerSample == 16 || fmt->bitsPerSample == 32)))) {
-    set_error("expects 8/16-bit int or fp16/fp32 float input");
-    delete d;
-    return;
-  }
-
-  // Flexible protocol (matches vsmigx): Model returns MAP {clip, num_planes}.
-  bool flex = !d->flexible_prop.empty();
-  VSMap* dst_map = flex ? vsapi->createMap() : out;
-  vsapi->createFilter(in, dst_map, "Model", hipInit, hipGetFrame, hipFree, fmParallel, 0, d, core);
-  if (flex) {
-    if (vsapi->propNumElements(dst_map, "clip") == 0) {
-      vsapi->freeMap(dst_map);
-      return;
-    }
-    int err2 = 0;
-    VSNodeRef* node = vsapi->propGetNode(dst_map, "clip", 0, &err2);
-    vsapi->freeMap(dst_map);
-    if (!node || err2) {
-      set_error("flexible mode: filter node lookup failed");
-      delete d;
-      return;
-    }
-    vsapi->propSetNode(out, "clip", node, paReplace);
-    vsapi->propSetInt(out, "num_planes", d->output_channels > 0 ? d->output_channels : 1, paReplace);
-    vsapi->freeNode(node);
+    fail("unknown exception");
   }
 }
 
@@ -525,51 +500,47 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
 // ---------------------------------------------------------------------------
 
 static void VS_CC hipVersion(const VSMap*, VSMap* out, void*, VSCore*, const VSAPI* vsapi) {
-  vsapi->propSetData(out, "version", "0.2.0", -1, paReplace);
+  vsapi->mapSetData(out, "version", "0.2.0", -1, dtUtf8, maReplace);
   int count = 0;
   if (hipGetDeviceCount(&count) == hipSuccess) {
-    vsapi->propSetInt(out, "device_count", count, paReplace);
+    vsapi->mapSetInt(out, "device_count", count, maReplace);
   }
 }
 
 static void VS_CC hipDeviceProperties(const VSMap* in, VSMap* out, void*, VSCore*,
                                       const VSAPI* vsapi) {
-  const int device_id = static_cast<int>(vsapi->propGetInt(in, "device_id", 0, nullptr));
+  const int device_id = vsapi->mapGetIntSaturated(in, "device_id", 0, nullptr);
   hipDeviceProp_t props{};
   if (hipGetDeviceProperties(&props, device_id) != hipSuccess) {
-    vsapi->setError(out, "hipDeviceProperties: failed to query device");
+    vsapi->mapSetError(out, "hipDeviceProperties: failed to query device");
     return;
   }
-  vsapi->propSetData(out, "name", props.name, -1, paReplace);
-  vsapi->propSetInt(out, "pci_device_id", static_cast<int64_t>(props.pciDeviceID), paReplace);
-  vsapi->propSetInt(out, "clock_rate", static_cast<int64_t>(props.clockRate), paReplace);
-  vsapi->propSetInt(out, "global_memory", static_cast<int64_t>(props.totalGlobalMem), paReplace);
+  vsapi->mapSetData(out, "name", props.name, static_cast<int>(std::strlen(props.name)), dtUtf8, maReplace);
+  vsapi->mapSetInt(out, "pci_device_id", static_cast<int64_t>(props.pciDeviceID), maReplace);
+  vsapi->mapSetInt(out, "clock_rate", static_cast<int64_t>(props.clockRate), maReplace);
+  vsapi->mapSetInt(out, "global_memory", static_cast<int64_t>(props.totalGlobalMem), maReplace);
 }
 
 // ---------------------------------------------------------------------------
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc,
-                                            VSRegisterFunction registerFunc,
-                                            VSPlugin* plugin) {
-  myself = plugin;
+VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
+  vspapi->configPlugin("com.thefeeltrain.vs_hip", "hip",
+                       "Standalone HIP ML filter (winograd WMMA, no ORT)",
+                       VS_MAKE_VERSION(0, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
 
-  configFunc("io.github.thefeeltrain.vs_hip", "hip",
-             "Standalone HIP ML filter (winograd WMMA, no ORT)",
-             VAPOURSYNTH_API_VERSION, 1, plugin);
+  vspapi->registerFunction("Model",
+                           "clips:vnode[];"
+                           "network_path:data;"
+                           "overlap:int[]:opt;"
+                           "tilesize:int[]:opt;"
+                           "device_id:int:opt;"
+                           "num_streams:int:opt;"
+                           "fp16:int:opt;"
+                           "flexible_output_prop:data:opt;",
+                           "any", hipCreate, nullptr, plugin);
 
-  registerFunc("Model",
-               "clips:clip[];"
-               "network_path:data;"
-               "overlap:int[]:opt;"
-               "tilesize:int[]:opt;"
-               "device_id:int:opt;"
-               "num_streams:int:opt;"
-               "fp16:int:opt;"
-               "flexible_output_prop:data:opt;",
-               hipCreate, nullptr, plugin);
-
-  registerFunc("Version", "", hipVersion, nullptr, plugin);
-  registerFunc("DeviceProperties", "device_id:int:opt;", hipDeviceProperties, nullptr, plugin);
+  vspapi->registerFunction("Version", "", "any", hipVersion, nullptr, plugin);
+  vspapi->registerFunction("DeviceProperties", "device_id:int:opt;", "any", hipDeviceProperties, nullptr, plugin);
 }

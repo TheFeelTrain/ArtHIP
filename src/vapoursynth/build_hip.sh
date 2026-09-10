@@ -3,6 +3,9 @@
 # No ONNX Runtime involved: the ONNX model is parsed directly and run with
 # the winograd WMMA kernels from src/hip/hip_kernels.h.
 #
+# VapourSynth API4 (VapourSynth4.h / VapourSynthPluginInit2); VS_USE_LATEST_API
+# declares API 4.2 to the host (R79) like the other API4 plugins.
+#
 # Usage: ./build_hip.sh [output_dir]
 set -euo pipefail
 
@@ -11,7 +14,7 @@ OUT_DIR="${1:-${SRC_DIR}/build}"
 mkdir -p "${OUT_DIR}"
 
 HIPCC="${HIPCC:-hipcc}"
-CXXFLAGS="-std=c++17 -O3 -ffast-math -fPIC -shared -w -DONNX_ML -DONNX_NAMESPACE=onnx"
+CXXFLAGS="-std=c++17 -O3 -ffast-math -fPIC -shared -w -DONNX_ML -DONNX_NAMESPACE=onnx -DVS_USE_LATEST_API"
 
 VS_INC="${VS_INC:-/usr/include/vapoursynth}"
 ONNX_INC="${ONNX_INC:-/usr/include}"

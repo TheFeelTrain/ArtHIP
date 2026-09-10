@@ -29,7 +29,30 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
   class to the pre-change 0.0117/0.0112. base on real jpbd frame 0: luma max
   0.00097, 0% > 0.02; U/V bit-identical (Catrom path, model not involved).
 
+## VapourSynth API4 port (2026-09-10, SHIPPED)
 
+vs_hip.cpp moved from API3 to API4 (`VapourSynthPluginInit2` / `configPlugin` /
+`createVideoFilter` / `VapourSynth4.h`); build_hip.sh adds `-DVS_USE_LATEST_API`
+(declares API 4.2, like the other plugins). Ported against
+reference/vs-mlrt-api4/vsmigx. Mechanical changes: prop*->map*, VSFrameRef->
+VSFrame, VSFormat->VSVideoFormat (now embedded by value in VSVideoInfo),
+registerFormat/getFormatPreset -> queryVideoFormat, createFilter(w/ init
+callback) -> createVideoFilter(w/ out vi), getFrame's instanceData is `void*`,
+arg spec `clips:vnode[]`. API4 has no filter-init callback, so the model load,
+shape probe and output-vi resolution moved from hipInit into hipCreate; the
+flexible path now writes "clip"+"num_planes" straight into `out`
+(createVideoFilter appends "clip"), dropping the temp-map copy.
+Verification (A/B same session, tmp/bench_port_ab.sh chroma 150f x3): api3
+21.77/21.44/21.57 vs api4 21.49/21.57/21.48 — perf-neutral. chroma/base/dehalo
+outputs BIT-IDENTICAL to the API3 build (chroma 320px: max 0.0095/0.0083 vs
+MIGX; base real jpbd luma 0.00097; dehalo RGBS 0.0034/0.0044/0.0039, 0% > 0.02).
+All input paths re-checked: GRAY8/GRAY16/GRAYH/GRAYS in, GRAYH/GRAYS out,
+num_streams 1-2, Version/DeviceProperties, 0-clip + missing-path errors clean.
+PRE-EXISTING (unchanged by the port, present in API3 too): fp16=0 leaves the
+model fp32, which the fp16 winograd engine cannot consume — output is ~0 and
+GRAYS (api4_paths.py shows maxdiff 1.0 vs fp16=1). Do not use fp16=0.
+
+## ROADMAP — occupancy & latency (next working session)
 
 Kernel is LATENCY-bound: 4.4 ms/conv vs 0.56 ms DRAM floor and 0.6 ms MMA
 floor (68 GFLOP @ ~15 TFLOPS of ~113 peak). Compute util ~13%. Everything
@@ -158,6 +181,8 @@ Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
 - Plugin: `src/vapoursynth/hip/{vs_hip.cpp, hip_engine.cc, hip_engine.h}`
   built by `src/vapoursynth/build_hip.sh`
   (`hipcc --offload-arch=gfx1100`, links system onnx + protobuf; no ORT).
+  VapourSynth API4 (`VapourSynth4.h`, `VapourSynthPluginInit2`,
+  `-DVS_USE_LATEST_API` = API 4.2).
 - Kernels: `src/hip/hip_kernels.h` - native wave32 WMMA via
   `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`; shared with `src/hip/`
   execution-provider code.
