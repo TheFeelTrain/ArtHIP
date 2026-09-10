@@ -2,8 +2,7 @@
 
 Runs fp16 conv-chain ONNX models (ArtCNN-style: 3x3 convs + DepthToSpace)
 directly on AMD GPUs through hand-written gfx1100 Winograd F(2x2,3x3) WMMA
-kernels. No Vulkan, no DirectML — HIP only. Currently beats the MIGraphX
-reference plugin (~17.3 vs ~15.7 fps @1080p, ArtCNN R8F64).
+kernels. Currently beats the MIGraphX reference plugin (~23.0 vs ~15.7 fps @1080p, ArtCNN R8F64).
 
 ## Layout
 
@@ -24,15 +23,11 @@ reference plugin (~17.3 vs ~15.7 fps @1080p, ArtCNN R8F64).
   plugins dir, e.g. `cp hip/build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
 - Provider (ORT EP): `cd src/hip && ./build.sh`
-- VapourSynth comparison: `MANGOHUD=0 VS_BACKEND=<hip|migx> vspipe -p
+- VapourSynth comparison: `VS_BACKEND=<hip|migx> vspipe -p
   tests/vs_test.py --` (500 blank 1920x1080 frames)
-- EP accuracy/speed: `MANGOHUD=0 .venv/bin/python tests/multires.py 256`
-  (run from the original checkout until a venv is set up here)
-- Run everything with `MANGOHUD=0` (the overlay skews clocks/measurement).
+- EP accuracy/speed: `python tests/multires.py 1920`
 
 ## Notes
 
 - Compute is fp16; clip IO follows the model like the MIGX plugin: GRAYS
   in → GRAYS out, GRAYH/int in → GRAYH out.
-- `reference/` (migraphx/llama.cpp/dml baselines) and the Vulkan EP were
-  deliberately left behind in the parent repo — this tree is HIP-only.
