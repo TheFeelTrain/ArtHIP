@@ -302,6 +302,202 @@ def _dts_b3(out: Path) -> Fixture:
     return _dts_fixture(out, "dts_b3", 3)
 
 
+def _dts_multi_fixture(out: Path, name: str, *, blocksize: int, cout: int,
+                       fp32_out: bool) -> Fixture:
+    """DepthToSpace with several OUTPUT channels (P2-10).
+
+    The DCR and CRD channel orders coincide only for a single output channel, so
+    a multi-channel tail is what distinguishes them.
+    """
+    m = cout * blocksize * blocksize
+    w = _kern(90 + blocksize * 10 + cout, m, 1)
+    b = _linspace(m, -0.05, 0.05)
+    nodes = [
+        _conv_node("x", "w", "b", "raw"),
+        helper.make_node("DepthToSpace", ["raw"], ["sq"], blocksize=blocksize, mode="DCR"),
+    ]
+    if fp32_out:
+        nodes.append(helper.make_node("Cast", ["sq"], ["y"], to=TensorProto.FLOAT))
+        out_name, out_type = "y", TensorProto.FLOAT
+    else:
+        out_name, out_type = "sq", TensorProto.FLOAT16
+    model = _model(nodes, "x", [1, 1, "h", "w"], TensorProto.FLOAT16,
+                   out_name, [1, cout, "h", "w"], out_type, [_half("w", w), _half("b", b)])
+    return Fixture(name=name, model=_save(model, out / f"{name}.onnx"), input_channels=1,
+                   output_channels=cout, weights=w.astype(np.float16), bias=b.astype(np.float16),
+                   blocksize=blocksize, fp32_io=fp32_out)
+
+
+@fixture("dts_multi_b2")
+def _dts_multi_b2(out: Path) -> Fixture:
+    """DTS blocksize 2 with two output channels, fp32 output (generic kernel)."""
+    return _dts_multi_fixture(out, "dts_multi_b2", blocksize=2, cout=2, fp32_out=True)
+
+
+@fixture("dts_multi_b2_f16")
+def _dts_multi_b2_f16(out: Path) -> Fixture:
+    """DTS blocksize 2 with two output channels, fp16 output (NCHW boundary)."""
+    return _dts_multi_fixture(out, "dts_multi_b2_f16", blocksize=2, cout=2, fp32_out=False)
+
+
+@fixture("dts_multi_b3")
+def _dts_multi_b3(out: Path) -> Fixture:
+    """DTS blocksize 3 with two output channels, fp32 output."""
+    return _dts_multi_fixture(out, "dts_multi_b3", blocksize=3, cout=2, fp32_out=True)
+
+
+# ---------------------------------------------------------------------------
+# Fusion with shared intermediates (P2-13)
+# ---------------------------------------------------------------------------
+
+
+@fixture("silu_shared")
+def _silu_shared(out: Path) -> Fixture:
+    """raw = conv(x); z = raw * sigmoid(raw); y = raw + z.
+
+    The conv output has consumers besides the SiLU pair, so the SiLU fusion must
+    be declined; fusing it would delete ``raw`` and break the Add.
+    """
+    w = _kern(63, 4, 4)
+    b = _linspace(4)
+    n0 = _conv_node("x", "w", "b", "raw")
+    n1 = helper.make_node("Sigmoid", ["raw"], ["sig"])
+    n2 = helper.make_node("Mul", ["raw", "sig"], ["z"])
+    n3 = helper.make_node("Add", ["raw", "z"], ["y"])
+    model = _model([n0, n1, n2, n3], "x", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   "y", [1, 4, "h", "w"], TensorProto.FLOAT16, [_half("w", w), _half("b", b)])
+    return Fixture(name="silu_shared", model=_save(model, out / "silu_shared.onnx"),
+                   input_channels=4, output_channels=4,
+                   weights=w.astype(np.float16), bias=b.astype(np.float16))
+
+
+@fixture("add_shared_conv_out")
+def _add_shared_conv_out(out: Path) -> Fixture:
+    """a = conv(x); bb = conv(a); s = a + bb; y = bb * s.
+
+    The conv producing ``bb`` feeds both the residual Add and the Mul, so the
+    Add must not be fused into it (that would rename ``bb`` away).
+    """
+    w = (_kern(64, 4, 4) * 0.2).astype(np.float32)  # keep the reference in fp16 range
+    b = _linspace(4)
+    n0 = _conv_node("x", "w", "b", "a")
+    n1 = _conv_node("a", "w", "b", "bb")
+    n2 = helper.make_node("Add", ["a", "bb"], ["s"])
+    n3 = helper.make_node("Mul", ["bb", "s"], ["y"])
+    model = _model([n0, n1, n2, n3], "x", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   "y", [1, 4, "h", "w"], TensorProto.FLOAT16, [_half("w", w), _half("b", b)])
+    return Fixture(name="add_shared_conv_out", model=_save(model, out / "add_shared_conv_out.onnx"),
+                   input_channels=4, output_channels=4,
+                   weights=w.astype(np.float16), bias=b.astype(np.float16))
+
+
+# ---------------------------------------------------------------------------
+# Conv padding / Clip bounds (P2-14)
+# ---------------------------------------------------------------------------
+
+
+@fixture("conv_pads_asym")
+def _conv_pads_asym(out: Path) -> Fixture:
+    """A 3x3 Conv padded [top=1, left=0, bottom=1, right=0].
+
+    Reading pads[0] and pads[2] as (h, w) silently treated this as full
+    padding; ONNX semantics make it a different, smaller-output convolution.
+    """
+    return _single_conv(out, "conv_pads_asym", m=4, c=4, seed=33, bias="none",
+                        pads=(1, 0, 1, 0))
+
+
+@fixture("clip_no_bounds")
+def _clip_no_bounds(out: Path) -> Fixture:
+    """Conv -> Clip with no bounds: ONNX means the type's extrema, so the clip
+    must be a no-op rather than clamping to [0, 1]."""
+    w = _kern(34, 4, 4)
+    b = np.full((4,), 2.0, dtype=np.float32)  # push the output well above 1.0
+    n0 = _conv_node("x", "w", "b", "raw")
+    n1 = helper.make_node("Clip", ["raw"], ["y"])
+    model = _model([n0, n1], "x", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   "y", [1, 4, "h", "w"], TensorProto.FLOAT16, [_half("w", w), _half("b", b)])
+    return Fixture(name="clip_no_bounds", model=_save(model, out / "clip_no_bounds.onnx"),
+                   input_channels=4, output_channels=4,
+                   weights=w.astype(np.float16), bias=b.astype(np.float16))
+
+
+@fixture("clip_dynamic_bound")
+def _clip_dynamic_bound(out: Path) -> Fixture:
+    """Clip whose lower bound is an activation, not an initializer."""
+    w = _kern(35, 4, 4)
+    n0 = _conv_node("x", "w", None, "raw")
+    n1 = helper.make_node("Clip", ["raw", "raw"], ["y"])
+    model = _model([n0, n1], "x", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   "y", [1, 4, "h", "w"], TensorProto.FLOAT16, [_half("w", w)])
+    return Fixture(name="clip_dynamic_bound", model=_save(model, out / "clip_dynamic_bound.onnx"),
+                   input_channels=4, output_channels=4, weights=w.astype(np.float16))
+
+
+# ---------------------------------------------------------------------------
+# Execution-provider partition boundaries (P2-17)
+# ---------------------------------------------------------------------------
+
+
+@fixture("ep_two_inputs")
+def _ep_two_inputs(out: Path) -> Fixture:
+    """Two activation inputs added together: the boundary cannot be represented
+    by the EP's single-activation-input compiled graph."""
+    x1 = _vi("x1", [1, 4, "h", "w"], TensorProto.FLOAT16)
+    x2 = _vi("x2", [1, 4, "h", "w"], TensorProto.FLOAT16)
+    graph = helper.make_graph(
+        [helper.make_node("Add", ["x1", "x2"], ["y"])],
+        "fixture", [x1, x2],
+        [_vi("y", [1, 4, "h", "w"], TensorProto.FLOAT16)], [],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
+    return Fixture(name="ep_two_inputs", model=_save(model, out / "ep_two_inputs.onnx"),
+                   input_channels=4, output_channels=4)
+
+
+@fixture("ep_two_convs_one_input")
+def _ep_two_convs_one_input(out: Path) -> Fixture:
+    """One graph input feeding two convs whose outputs are added.
+
+    The external input list must be deduplicated, otherwise the run looks like a
+    two-input region and is (correctly) refused.
+    """
+    w1 = _kern(81, 4, 4)
+    w2 = _kern(82, 4, 4)
+    b1 = _linspace(4)
+    b2 = _linspace(4, -0.2, 0.2)
+    n0 = _conv_node("x", "w1", "b1", "ca")
+    n1 = _conv_node("x", "w2", "b2", "cb")
+    n2 = helper.make_node("Add", ["ca", "cb"], ["y"])
+    model = _model([n0, n1, n2], "x", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   "y", [1, 4, "h", "w"], TensorProto.FLOAT16,
+                   [_half("w1", w1), _half("b1", b1), _half("w2", w2), _half("b2", b2)])
+    return Fixture(name="ep_two_convs_one_input",
+                   model=_save(model, out / "ep_two_convs_one_input.onnx"),
+                   input_channels=4, output_channels=4, weights=w1.astype(np.float16),
+                   bias=b1.astype(np.float16))
+
+
+@fixture("identity_fp32io")
+def _identity_fp32io(out: Path) -> Fixture:
+    """fp32 graph IO around an fp16 identity conv (P2-12).
+
+    The plugin must widen an integer or half clip to fp32 for this model;
+    writing the packed half values into the four-byte staging buffer produced
+    ~3e-5 instead of ~0.502 for a GRAY8 frame of 128.
+    """
+    ident = np.zeros((1, 1, 3, 3), dtype=np.float32)
+    ident[0, 0, 1, 1] = 1.0
+    n0 = helper.make_node("Cast", ["x"], ["xh"], to=TensorProto.FLOAT16)
+    n1 = _conv_node("xh", "w", None, "raw")
+    n2 = helper.make_node("Cast", ["raw"], ["y"], to=TensorProto.FLOAT)
+    model = _model([n0, n1, n2], "x", [1, 1, "h", "w"], TensorProto.FLOAT,
+                   "y", [1, 1, "h", "w"], TensorProto.FLOAT, [_half("w", ident)])
+    return Fixture(name="identity_fp32io", model=_save(model, out / "identity_fp32io.onnx"),
+                   input_channels=1, output_channels=1, weights=ident.astype(np.float16),
+                   fp32_io=True)
+
+
 # ---------------------------------------------------------------------------
 # Execution-provider fixture (P1-4)
 # ---------------------------------------------------------------------------

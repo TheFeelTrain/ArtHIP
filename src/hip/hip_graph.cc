@@ -159,6 +159,11 @@ void HipGraph::DestroyDeviceState() {
     hipFreeHost(output_staging_);
     output_staging_ = nullptr;
   }
+  if (io_scratch_) {
+    hipFree(io_scratch_);
+    io_scratch_ = nullptr;
+  }
+  io_scratch_bytes_ = 0;
   built_ = false;
 }
 
@@ -302,14 +307,22 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
         if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
           op.pad_h = 1;
           op.pad_w = 1;
+        } else if (auto_pad != "VALID" && auto_pad != "NOTSET") {
+          return Status(common::ONNXRUNTIME, common::FAIL,
+                        "HIP EP: unsupported Conv auto_pad '" + auto_pad + "'.");
         }
       }
       if (attrs.count("pads")) {
         const auto& a = attrs.at("pads");
-        if (a.ints_size() >= 4) {
-          op.pad_h = static_cast<int>(a.ints(0));
-          op.pad_w = static_cast<int>(a.ints(2));
+        // ONNX pads = [top, left, bottom, right]; the kernel implements
+        // symmetric 1-padding on both axes, so all four entries must be 1.
+        if (a.ints_size() != 4 || a.ints(0) != 1 || a.ints(1) != 1 || a.ints(2) != 1 ||
+            a.ints(3) != 1) {
+          return Status(common::ONNXRUNTIME, common::FAIL,
+                        "HIP EP: unsupported Conv pads (only symmetric 1-padding on both axes).");
         }
+        op.pad_h = 1;
+        op.pad_w = 1;
       }
 
       if (!IsSupportedConv(op)) {
@@ -354,24 +367,58 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
         }
       }
 
-      // Fuse the SiLU (Sigmoid + Mul) epilogue into the conv.
+      // Fuse the SiLU (Sigmoid + Mul) epilogue into the conv. The conv output
+      // is renamed to the Mul's output, so the pattern is only fusable when the
+      // conv output has no consumer besides the Sigmoid and the Mul (checked
+      // below) and the Sigmoid output is used only by the Mul. Otherwise a
+      // residual branch or a graph output would lose its producer.
       const std::string conv_out = op.out;
-      for (auto it = node->OutputNodesBegin(); it != node->OutputNodesEnd(); ++it) {
-        const Node& consumer = *it;
-        if (consumer.OpType() == "Sigmoid") {
-          const std::string& s_out = consumer.OutputDefs()[0]->Name();
-          for (auto it2 = consumer.OutputNodesBegin(); it2 != consumer.OutputNodesEnd(); ++it2) {
-            const Node& mul_node = *it2;
-            if (mul_node.OpType() == "Mul" && mul_node.InputDefs().size() == 2) {
-              auto md = mul_node.InputDefs();
-              const std::string& n0 = md[0]->Name();
-              const std::string& n1 = md[1]->Name();
-              if ((n0 == conv_out && n1 == s_out) || (n0 == s_out && n1 == conv_out)) {
-                op.do_silu = true;
-                op.out = mul_node.OutputDefs()[0]->Name();
-                consumed.insert(consumer.Index());  // Sigmoid
-                consumed.insert(mul_node.Index());  // Mul
-                break;
+      {
+        bool conv_out_is_graph_output = false;
+        for (const auto* go : graph.GetOutputs()) {
+          if (go != nullptr && go->Exists() && go->Name() == conv_out) {
+            conv_out_is_graph_output = true;
+            break;
+          }
+        }
+        if (!conv_out_is_graph_output) {
+          for (auto it = node->OutputNodesBegin(); it != node->OutputNodesEnd(); ++it) {
+            const Node& consumer = *it;
+            if (consumer.OpType() != "Sigmoid") {
+              continue;
+            }
+            const std::string& s_out = consumer.OutputDefs()[0]->Name();
+            for (auto it2 = consumer.OutputNodesBegin(); it2 != consumer.OutputNodesEnd(); ++it2) {
+              const Node& mul_node = *it2;
+              if (mul_node.OpType() == "Mul" && mul_node.InputDefs().size() == 2) {
+                auto md = mul_node.InputDefs();
+                const std::string& n0 = md[0]->Name();
+                const std::string& n1 = md[1]->Name();
+                if ((n0 == conv_out && n1 == s_out) || (n0 == s_out && n1 == conv_out)) {
+                  // Every consumer of the conv output must be this Sigmoid or
+                  // this Mul, and the Sigmoid must feed only this Mul.
+                  bool silu_only = true;
+                  for (auto itc = node->OutputNodesBegin(); itc != node->OutputNodesEnd(); ++itc) {
+                    if (itc->Index() != consumer.Index() && itc->Index() != mul_node.Index()) {
+                      silu_only = false;
+                      break;
+                    }
+                  }
+                  for (auto itc = consumer.OutputNodesBegin();
+                       itc != consumer.OutputNodesEnd() && silu_only; ++itc) {
+                    if (itc->Index() != mul_node.Index()) {
+                      silu_only = false;
+                    }
+                  }
+                  if (!silu_only) {
+                    continue;
+                  }
+                  op.do_silu = true;
+                  op.out = mul_node.OutputDefs()[0]->Name();
+                  consumed.insert(consumer.Index());  // Sigmoid
+                  consumed.insert(mul_node.Index());  // Mul
+                  break;
+                }
               }
             }
           }
@@ -392,32 +439,31 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
     } else if (optype == "Clip") {
       op.type = OpType::Clip;
       op.in0 = in_name(0);
-      op.clip_min = 0.0f;
-      op.clip_max = 1.0f;
-      if (input_defs.size() > 1) {
-        std::string min_name = in_name(1);
-        if (!min_name.empty()) {
-          std::vector<uint8_t> raw;
-          std::vector<int64_t> dims;
-          auto st = read_initializer(min_name, raw, dims);
-          if (st.IsOK() && raw.size() >= 2) {
-            MLFloat16 v;
-            std::memcpy(&v, raw.data(), 2);
-            op.clip_min = v.ToFloat();
-          }
+      const auto& attrs = node->GetAttributes();
+      // ONNX Clip bounds are optional in both the attribute (opset < 11) and
+      // input (opset >= 11) forms; an omitted bound means the element type's
+      // extrema, not 0/1. Only initializer-backed inputs reach here: GetCapability
+      // rejects a node with a dynamic bound.
+      if (attrs.count("min")) op.clip_min = attrs.at("min").f();
+      if (attrs.count("max")) op.clip_max = attrs.at("max").f();
+      if (input_defs.size() > 1 && input_defs[1] != nullptr && input_defs[1]->Exists()) {
+        std::vector<uint8_t> raw;
+        std::vector<int64_t> dims;
+        ORT_RETURN_IF_ERROR(read_initializer(input_defs[1]->Name(), raw, dims));
+        if (raw.size() >= 2) {
+          MLFloat16 v;
+          std::memcpy(&v, raw.data(), 2);
+          op.clip_min = v.ToFloat();
         }
       }
-      if (input_defs.size() > 2) {
-        std::string max_name = in_name(2);
-        if (!max_name.empty()) {
-          std::vector<uint8_t> raw;
-          std::vector<int64_t> dims;
-          auto st = read_initializer(max_name, raw, dims);
-          if (st.IsOK() && raw.size() >= 2) {
-            MLFloat16 v;
-            std::memcpy(&v, raw.data(), 2);
-            op.clip_max = v.ToFloat();
-          }
+      if (input_defs.size() > 2 && input_defs[2] != nullptr && input_defs[2]->Exists()) {
+        std::vector<uint8_t> raw;
+        std::vector<int64_t> dims;
+        ORT_RETURN_IF_ERROR(read_initializer(input_defs[2]->Name(), raw, dims));
+        if (raw.size() >= 2) {
+          MLFloat16 v;
+          std::memcpy(&v, raw.data(), 2);
+          op.clip_max = v.ToFloat();
         }
       }
     } else if (optype == "DepthToSpace") {
@@ -449,8 +495,25 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
       producer[ops_[i].out] = i;
     }
     std::vector<size_t> remove_adds;
+    // Every op (by tensor name) that reads a given activation, fused epilogue
+    // inputs included.
+    auto activations_reading = [&](const std::string& t) {
+      std::vector<size_t> users;
+      for (size_t j = 0; j < ops_.size(); ++j) {
+        const OpSpec& o = ops_[j];
+        if (o.in0 == t || o.in1 == t || (o.do_add && o.add_input == t)) {
+          users.push_back(j);
+        }
+      }
+      return users;
+    };
     for (size_t i = 0; i < ops_.size(); ++i) {
       if (ops_[i].type != OpType::Add) {
+        continue;
+      }
+      // `x + x` would bind the conv's own input as the residual, computing
+      // conv_out + in instead of 2*conv_out.
+      if (ops_[i].in0 == ops_[i].in1) {
         continue;
       }
       const auto it_a = producer.find(ops_[i].in0);
@@ -462,6 +525,12 @@ common::Status HipGraph::CompileGraph(const GraphViewer& graph) {
       if (ops_[main].type == OpType::Conv) {
         const std::string main_out = (it_a->second >= it_b->second) ? ops_[i].in0 : ops_[i].in1;
         if (ops_[main].out == main_out) {
+          // The conv's output name is replaced by the Add's, so no other op may
+          // read `main_out`.
+          const auto users = activations_reading(main_out);
+          if (users.size() != 1 || users[0] != i) {
+            continue;
+          }
           ops_[main].do_add = true;
           ops_[main].add_input = (it_a->second >= it_b->second) ? ops_[i].in1 : ops_[i].in0;
           ops_[main].out = ops_[i].out;
@@ -1027,6 +1096,21 @@ common::Status HipGraph::EnsureBuilt(const std::vector<int64_t>& input_shape) {
       return fail_build(std::string("hipHostMalloc of the output staging buffer failed: ") +
                         hipGetErrorString(e));
     }
+    // ORT hands over NCHW tensors while the compute buffers are NHWC, so a
+    // multi-channel IO needs a transpose pass through this device scratch.
+    {
+      const uint32_t in_c = static_cast<uint32_t>(shapes[input_name_][3]);
+      const uint32_t out_c = static_cast<uint32_t>(shapes[output_name_][3]);
+      if (in_c > 1u) io_scratch_bytes_ = std::max(io_scratch_bytes_, input_bytes_);
+      if (out_c > 1u) io_scratch_bytes_ = std::max(io_scratch_bytes_, output_bytes_ * (output_is_fp32_ ? 2u : 1u));
+      if (io_scratch_bytes_ > 0) {
+        e = hipMalloc(&io_scratch_, io_scratch_bytes_);
+        if (e != hipSuccess) {
+          return fail_build(std::string("hipMalloc of the IO transpose buffer failed: ") +
+                            hipGetErrorString(e));
+        }
+      }
+    }
     e = hipDeviceSynchronize();
     if (e != hipSuccess) {
       return fail_build(std::string("hipDeviceSynchronize after setup failed: ") +
@@ -1145,7 +1229,8 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
   };
 
   // Upload the input into the persistent pinned staging buffer, converting
-  // fp32 -> fp16 on the host when the graph input is behind a Cast.
+  // fp32 -> fp16 on the host when the graph input is behind a Cast. The data is
+  // NCHW (ORT's layout) both before and after the conversion.
   if (input_is_fp32_) {
     const float* src = static_cast<const float*>(input_data);
     uint16_t* dst = static_cast<uint16_t*>(input_staging_);
@@ -1160,9 +1245,28 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
   auto prof_t2 = std::chrono::high_resolution_clock::now();
 
   {
-    hipError_t e = hipMemcpyAsync(buffers_[input_buffer_].ptr, input_staging_, input_bytes_,
-                                  hipMemcpyHostToDevice, stream);
-    if (e != hipSuccess) return run_fail("input upload", e);
+    const auto& ishape = tensor_map_[input_name_].shape;  // NHWC
+    const uint32_t iC = static_cast<uint32_t>(ishape[3]);
+    void* upload_dst = buffers_[input_buffer_].ptr;
+    if (iC > 1u) {
+      // NCHW staging -> NHWC compute buffer through the scratch.
+      hipError_t e = hipMemcpyAsync(io_scratch_, input_staging_, input_bytes_,
+                                    hipMemcpyHostToDevice, stream);
+      if (e != hipSuccess) return run_fail("input upload", e);
+      hipLaunchKernelGGL(transpose_f16,
+                         dim3(DivCeil(static_cast<uint64_t>(input_bytes_ / 2), 256u)),
+                         dim3(256), 0, stream,
+                         static_cast<const _Float16*>(io_scratch_),
+                         static_cast<_Float16*>(upload_dst),
+                         static_cast<uint32_t>(ishape[0]), iC,
+                         static_cast<uint32_t>(ishape[1]), static_cast<uint32_t>(ishape[2]), 1u);
+      hipError_t le = hipGetLastError();
+      if (le != hipSuccess) return run_fail("NCHW->NHWC input transpose launch", le);
+    } else {
+      hipError_t e = hipMemcpyAsync(upload_dst, input_staging_, input_bytes_,
+                                    hipMemcpyHostToDevice, stream);
+      if (e != hipSuccess) return run_fail("input upload", e);
+    }
   }
 
   for (size_t dop_i = 0; dop_i < device_ops_.size(); ++dop_i) {
@@ -1243,8 +1347,55 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
   auto prof_t2b = std::chrono::high_resolution_clock::now();
 
   {
-    hipError_t e = hipMemcpyAsync(output_data, buffers_[output_buffer_].ptr, output_bytes_,
-                                  hipMemcpyDeviceToHost, stream);
+    // The compute output is NHWC; the ORT tensor is NCHW. For a single channel
+    // the two layouts coincide; otherwise transpose (and expand to float when
+    // the graph output sits behind a Cast) through the device scratch.
+    const auto& oshape = tensor_map_[output_name_].shape;  // NHWC
+    const uint32_t oC = static_cast<uint32_t>(oshape[3]);
+    const uint32_t oN = static_cast<uint32_t>(oshape[0]);
+    const uint32_t oH = static_cast<uint32_t>(oshape[1]);
+    const uint32_t oW = static_cast<uint32_t>(oshape[2]);
+    hipError_t e = hipSuccess;
+    const size_t out_bytes = output_is_fp32_ ? output_ort_bytes_ : output_bytes_;
+    if (output_is_fp32_ && oC > 1u) {
+      hipLaunchKernelGGL(cast_f16_to_f32_transpose,
+                         dim3(DivCeil(static_cast<uint64_t>(oN) * oH * oW, 256u)),
+                         dim3(256), 0, stream,
+                         static_cast<const _Float16*>(buffers_[output_buffer_].ptr),
+                         static_cast<float*>(io_scratch_),
+                         oN, oC, oH, oW);
+      hipError_t le = hipGetLastError();
+      if (le != hipSuccess) return run_fail("NHWC->NCHW fp32 output cast launch", le);
+      e = hipMemcpyAsync(output_data, io_scratch_, out_bytes, hipMemcpyDeviceToHost, stream);
+    } else if (!output_is_fp32_ && oC > 1u) {
+      hipLaunchKernelGGL(transpose_f16,
+                         dim3(DivCeil(static_cast<uint64_t>(oN) * oC * oH * oW, 256u)),
+                         dim3(256), 0, stream,
+                         static_cast<const _Float16*>(buffers_[output_buffer_].ptr),
+                         static_cast<_Float16*>(io_scratch_),
+                         oN, oC, oH, oW, 0u);
+      hipError_t le = hipGetLastError();
+      if (le != hipSuccess) return run_fail("NHWC->NCHW output transpose launch", le);
+      e = hipMemcpyAsync(output_data, io_scratch_, out_bytes, hipMemcpyDeviceToHost, stream);
+    } else if (output_is_fp32_) {
+      // Single channel: download the half data into the pinned staging buffer
+      // first, then expand. Reading the half source in place inside output_data
+      // would consume values that earlier (wider) float writes overwrote.
+      e = hipMemcpyAsync(output_staging_, buffers_[output_buffer_].ptr, output_bytes_,
+                         hipMemcpyDeviceToHost, stream);
+      if (e == hipSuccess) e = hipStreamSynchronize(stream);
+      if (e == hipSuccess) {
+        const uint16_t* src = static_cast<const uint16_t*>(output_staging_);
+        float* dst = static_cast<float*>(output_data);
+        const size_t count = output_bytes_ / 2;
+        for (size_t i = 0; i < count; ++i) {
+          dst[i] = HalfBitsToFloat(src[i]);
+        }
+      }
+    } else {
+      e = hipMemcpyAsync(output_data, buffers_[output_buffer_].ptr, output_bytes_,
+                         hipMemcpyDeviceToHost, stream);
+    }
     if (e != hipSuccess) return run_fail("output download", e);
     e = hipStreamSynchronize(stream);
     if (e != hipSuccess) return run_fail("stream synchronize", e);
@@ -1257,22 +1408,6 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
             std::chrono::duration<double, std::milli>(prof_t2 - prof_t1).count(),
             std::chrono::duration<double, std::milli>(prof_t2b - prof_t2).count(),
             std::chrono::duration<double, std::milli>(prof_tafter_submit - prof_t2b).count());
-  }
-
-  // The output is read straight into the ORT tensor; fp16->fp32 conversion is
-  // only needed when the graph output is behind a Cast (fp32 ORT tensor).
-  if (output_is_fp32_) {
-    // Keep the half data in the pinned staging copy and read from THERE: the
-    // half source and the float destination share output_data, so reading the
-    // source in place would consume bytes already overwritten by earlier
-    // (wider) float writes.
-    std::memcpy(output_staging_, output_data, output_bytes_);
-    const uint16_t* src = static_cast<const uint16_t*>(output_staging_);
-    float* dst = static_cast<float*>(output_data);
-    const size_t count = output_bytes_ / 2;
-    for (size_t i = 0; i < count; ++i) {
-      dst[i] = HalfBitsToFloat(src[i]);
-    }
   }
   auto prof_t3 = std::chrono::high_resolution_clock::now();
 

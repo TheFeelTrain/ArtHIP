@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,52 +132,8 @@ bool IsSupportedConv(const OpSpec& op) {
          op.pad_h == 1 && op.pad_w == 1 && op.group == 1;
 }
 
-// fp32 -> fp16 conversion for fp32-input models (raw host upload, on-device
-// cast; replaces the old per-pixel CPU conversion loop).
-__global__ void cast_f32_to_f16(const float* __restrict__ in,
-                                _Float16* __restrict__ out, uint32_t n) {
-  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = (_Float16)in[i];
-}
-
-// fp16 -> fp32 conversion for fp32-output models (compute stays fp16; the
-// float result matches what the MIGX plugin downloads).
-__global__ void cast_f16_to_f32(const _Float16* __restrict__ in,
-                                float* __restrict__ out, uint32_t n) {
-  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = (float)in[i];
-}
-
-// Fused NCHW->NHWC transpose + fp32->fp16 cast for multi-channel fp32 inputs:
-// the ORT-layout upload is NCHW, the compute buffer is NHWC. One thread per
-// (n, h, w) pixel, loops over C (C<=3 for our models; C=1 is a copy).
-__global__ void cast_f32_to_f16_transpose(const float* __restrict__ in,
-                                          _Float16* __restrict__ out,
-                                          uint32_t N, uint32_t C,
-                                          uint32_t H, uint32_t W) {
-  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= N * H * W) return;
-  const uint32_t n = i / (H * W);
-  const uint32_t hw = i - n * H * W;
-  for (uint32_t c = 0; c < C; ++c) {
-    out[(n * H * W + hw) * C + c] = (_Float16)in[(n * C + c) * H * W + hw];
-  }
-}
-
-// Fused NHWC->NCHW transpose + fp16->fp32 cast for multi-channel fp32
-// outputs: the compute buffer is NHWC, the download is ORT NCHW.
-__global__ void cast_f16_to_f32_transpose(const _Float16* __restrict__ in,
-                                          float* __restrict__ out,
-                                          uint32_t N, uint32_t C,
-                                          uint32_t H, uint32_t W) {
-  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= N * H * W) return;
-  const uint32_t n = i / (H * W);
-  const uint32_t hw = i - n * H * W;
-  for (uint32_t c = 0; c < C; ++c) {
-    out[(n * C + c) * H * W + hw] = (float)in[(n * H * W + hw) * C + c];
-  }
-}
+// Layout/dtype conversion kernels (transpose_f16, cast_f32_to_f16_transpose,
+// cast_f16_to_f32_transpose) live in hip_kernels.h so the EP shares them.
 
 }  // namespace
 
@@ -193,6 +150,10 @@ void HipEngine::DestroyDeviceState() {
   // Freeing device memory requires the owning device to be current on THIS
   // thread; the destructor and rebuild paths can run on any thread.
   hipSetDevice(device_id_);
+  for (void* e : prof_events_) {
+    if (e) hipEventDestroy(static_cast<hipEvent_t>(e));
+  }
+  prof_events_.clear();
   for (auto& buf : buffers_) {
     if (buf.ptr) hipFree(buf.ptr);
   }
@@ -225,6 +186,11 @@ void HipEngine::DestroyDeviceState() {
     hipFree(output_f32_dev_);
     output_f32_dev_ = nullptr;
   }
+  if (io_f16_dev_) {
+    hipFree(io_f16_dev_);
+    io_f16_dev_ = nullptr;
+  }
+  io_f16_dev_bytes_ = 0;
   built_ = false;
 }
 
@@ -280,6 +246,30 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   // fp32 model I/O detection (with converter-inserted boundary casts) happens
   // further down, in the same pass that marks the Cast nodes consumed.
 
+  // Tensors whose values must survive: every declared graph output plus the
+  // (possibly Cast-rewritten) tensor this engine actually downloads. A fusion
+  // that renames the op producing one of these away would silently drop it.
+  std::unordered_set<std::string> protected_outputs;
+  for (int oi = 0; oi < graph.output_size(); ++oi) {
+    protected_outputs.insert(graph.output(oi).name());
+  }
+  // True when every consumer of `t` is one of `allowed` and `t` need not be
+  // retained: only then is removing the producer's original name safe. Output
+  // name comparison is deferred to call time because the boundary-Cast pass
+  // rewrites output_name_ to the tensor before the output cast.
+  auto solely_consumed_by = [&](const std::string& t,
+                                std::initializer_list<int> allowed) -> bool {
+    if (t == output_name_ || protected_outputs.count(t)) return false;
+    for (int ci : out_nodes(t)) {
+      bool ok = false;
+      for (int a : allowed) {
+        if (a == ci) ok = true;
+      }
+      if (!ok) return false;
+    }
+    return true;
+  };
+
   // Clip-bound scalar: fp32 (float), fp16 (half) or double initializer -> float.
   // (The fp16 luma model stores half bounds; the fp32 chroma model stores
   // float bounds. Reading float bits as half gave min=-0.0/max=1.9e-3,
@@ -318,6 +308,19 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
     }
     error = "Clip bound initializer '" + name + "' has an unsupported dtype or truncated storage";
     return false;
+  };
+
+  // One optional Clip bound. An omitted (empty) input name keeps the default
+  // (+/-inf); a *dynamic* bound (any non-initializer) is rejected rather than
+  // silently replaced, because the engine cannot evaluate it.
+  auto clip_bound = [&](const std::string& name, float& dst) -> bool {
+    if (name.empty()) return true;
+    if (!weights_.count(name)) {
+      error = "Clip bound '" + name +
+              "' is not an initializer; dynamic Clip bounds are not supported";
+      return false;
+    }
+    return clip_scalar(name, dst);
   };
 
   auto read_initializer = [&](const std::string& name, std::vector<uint8_t>& data,
@@ -400,13 +403,29 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         op.dil_w = static_cast<int>(a->ints(1));
       }
       if (auto a = attr(n, "group")) op.group = static_cast<int>(a->i());
-      if (auto a = attr(n, "auto_pad"); a && (a->s() == "SAME_UPPER" || a->s() == "SAME_LOWER")) {
+      // ONNX pads are [x1_begin, x2_begin, ..., x1_end, x2_end], i.e.
+      // [top, left, bottom, right] for 2D. The kernel implements symmetric
+      // padding of 1 on both axes, so every entry must be 1: reading indices 0
+      // and 2 as (pad_h, pad_w) would silently treat [1,0,1,0] as full padding
+      // and compute a different convolution than the model specifies.
+      if (auto a = attr(n, "auto_pad")) {
+        const std::string& ap = a->s();
+        if (ap == "SAME_UPPER" || ap == "SAME_LOWER") {
+          op.pad_h = 1;
+          op.pad_w = 1;
+        } else if (ap != "VALID" && ap != "NOTSET") {
+          error = "unsupported Conv auto_pad '" + ap + "'";
+          return false;
+        }
+      }
+      if (auto a = attr(n, "pads"); a && !a->ints().empty()) {
+        if (a->ints_size() != 4 ||
+            a->ints(0) != 1 || a->ints(1) != 1 || a->ints(2) != 1 || a->ints(3) != 1) {
+          error = "unsupported Conv pads (only symmetric 1-padding on both axes is supported)";
+          return false;
+        }
         op.pad_h = 1;
         op.pad_w = 1;
-      }
-      if (auto a = attr(n, "pads"); a && a->ints_size() >= 4) {
-        op.pad_h = static_cast<int>(a->ints(0));
-        op.pad_w = static_cast<int>(a->ints(2));
       }
       if (!IsSupportedConv(op)) {
         error = "unsupported Conv configuration (only 3x3 stride 1, pad 1 supported)";
@@ -471,7 +490,11 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         }
       }
 
-      // Fuse the SiLU (Sigmoid + Mul) epilogue into the conv.
+      // Fuse the SiLU (Sigmoid + Mul) epilogue into the conv. The conv output
+      // is renamed to the Mul's output, so the pattern is only fusable when the
+      // conv output has no consumer besides the Sigmoid and the Mul and is not
+      // a graph output (otherwise a residual branch or a second output would
+      // lose its producer), and the Sigmoid output is used only by the Mul.
       const std::string conv_out = op.out;
       for (int ci : out_nodes(conv_out)) {
         const auto& consumer = node_of(ci);
@@ -483,6 +506,10 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
               const std::string& n0 = mul_node.input(0);
               const std::string& n1 = mul_node.input(1);
               if ((n0 == conv_out && n1 == s_out) || (n0 == s_out && n1 == conv_out)) {
+                if (!solely_consumed_by(conv_out, {ci, ci2}) ||
+                    !solely_consumed_by(s_out, {ci2})) {
+                  continue;
+                }
                 op.do_silu = true;
                 op.out = mul_node.output(0);
                 consumed[ci] = true;   // Sigmoid
@@ -507,10 +534,12 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
     } else if (optype == "Clip") {
       op.type = OpType::Clip;
       op.in0 = in_name(0);
+      // Attribute form (opset < 11) then input form (opset >= 11). Whatever is
+      // absent keeps the +/-inf default, so an omitted bound never clamps.
       if (auto a = attr(n, "min")) op.clip_min = a->f();
       if (auto a = attr(n, "max")) op.clip_max = a->f();
-      if (n.input_size() > 1 && !n.input(1).empty() && !clip_scalar(n.input(1), op.clip_min)) return false;
-      if (n.input_size() > 2 && !n.input(2).empty() && !clip_scalar(n.input(2), op.clip_max)) return false;
+      if (!clip_bound(in_name(1), op.clip_min)) return false;
+      if (!clip_bound(in_name(2), op.clip_max)) return false;
     } else if (optype == "DepthToSpace") {
       op.type = OpType::DepthToSpace;
       op.in0 = in_name(0);
@@ -523,14 +552,17 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
         error = "only DepthToSpace mode DCR is supported";
         return false;
       }
-      // Fuse an immediately-following Clip into this op (elementwise).
+      // Fuse an immediately-following Clip into this op (elementwise), but only
+      // when the DTS output has no other consumer: the fused op is renamed to
+      // the Clip's output, so any other consumer would lose its producer.
       for (int ci : out_nodes(op.out)) {
         const auto& cn = node_of(ci);
         if (cn.op_type() != "Clip" || consumed[ci]) continue;
+        if (!solely_consumed_by(op.out, {ci})) continue;
         if (auto a = attr(cn, "min")) op.clip_min = a->f();
         if (auto a = attr(cn, "max")) op.clip_max = a->f();
-        if (cn.input_size() > 1 && !cn.input(1).empty() && !clip_scalar(cn.input(1), op.clip_min)) return false;
-        if (cn.input_size() > 2 && !cn.input(2).empty() && !clip_scalar(cn.input(2), op.clip_max)) return false;
+        if (!clip_bound(cn.input_size() > 1 ? cn.input(1) : std::string(), op.clip_min)) return false;
+        if (!clip_bound(cn.input_size() > 2 ? cn.input(2) : std::string(), op.clip_max)) return false;
         op.fuse_clip = true;
         consumed[ci] = true;
         op.out = cn.output(0);  // produce the Clip's output tensor directly
@@ -547,9 +579,21 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
   {
     std::unordered_map<std::string, size_t> producer;
     for (size_t i = 0; i < ops_.size(); ++i) producer[ops_[i].out] = i;
+    // Every op (by name) that reads `t`, including fused epilogue inputs.
+    auto activations_reading = [&](const std::string& t) {
+      std::vector<size_t> users;
+      for (size_t j = 0; j < ops_.size(); ++j) {
+        const OpSpec& o = ops_[j];
+        if (o.in0 == t || o.in1 == t || (o.do_add && o.add_input == t)) users.push_back(j);
+      }
+      return users;
+    };
     std::vector<size_t> remove_adds;
     for (size_t i = 0; i < ops_.size(); ++i) {
       if (ops_[i].type != OpType::Add) continue;
+      // Both operands must be distinct: `x + x` would bind the conv's own input
+      // as the residual and compute conv_out + in instead of 2*conv_out.
+      if (ops_[i].in0 == ops_[i].in1) continue;
       const auto it_a = producer.find(ops_[i].in0);
       const auto it_b = producer.find(ops_[i].in1);
       if (it_a == producer.end() || it_b == producer.end()) continue;
@@ -557,6 +601,13 @@ bool HipEngine::Build(const ONNX_NAMESPACE::ModelProto& model, std::string& erro
       if (ops_[main].type == OpType::Conv) {
         const std::string main_out = (it_a->second >= it_b->second) ? ops_[i].in0 : ops_[i].in1;
         if (ops_[main].out == main_out) {
+          // The conv's output name is replaced by the Add's, so no other op may
+          // read `main_out` and it must not be a graph output.
+          const auto users = activations_reading(main_out);
+          if (protected_outputs.count(main_out) || main_out == output_name_ ||
+              users.size() != 1 || users[0] != i) {
+            continue;
+          }
           ops_[main].do_add = true;
           ops_[main].add_input = (it_a->second >= it_b->second) ? ops_[i].in1 : ops_[i].in0;
           ops_[main].out = ops_[i].out;
@@ -1076,8 +1127,41 @@ bool HipEngine::EnsureBuilt(const std::vector<int64_t>& input_shape, std::string
       e = hipMalloc(&output_f32_dev_, output_ort_bytes_);
       if (e != hipSuccess) return hip_fail("hipMalloc of fp32 output buffer", e);
     }
+    // fp16 IO with more than one channel needs an NCHW<->NHWC transpose; the
+    // scratch is the side that is not the compute buffer. C==1 is the same
+    // layout in both and skips it (the shipped luma path).
+    {
+      const uint32_t in_c = static_cast<uint32_t>(shapes[input_name_][3]);
+      const uint32_t out_c = static_cast<uint32_t>(shapes[output_name_][3]);
+      if (!input_is_fp32_ && in_c > 1u) io_f16_dev_bytes_ = std::max(io_f16_dev_bytes_, input_bytes_);
+      if (!output_is_fp32_ && out_c > 1u) io_f16_dev_bytes_ = std::max(io_f16_dev_bytes_, output_bytes_);
+      if (io_f16_dev_bytes_ > 0) {
+        e = hipMalloc(&io_f16_dev_, io_f16_dev_bytes_);
+        if (e != hipSuccess) return hip_fail("hipMalloc of fp16 IO transpose buffer", e);
+      }
+    }
     e = hipDeviceSynchronize();
     if (e != hipSuccess) return hip_fail("hipDeviceSynchronize after setup", e);
+  }
+
+  // VSHIP_PROFILE: the per-op events are created once per built plan and
+  // destroyed with the device state, so a profiling run does not allocate and
+  // free 2*ops+2 events on every frame.
+  {
+    static const bool prof = [] { const char* e = std::getenv("VSHIP_PROFILE"); return e && *e == '1'; }();
+    if (prof) {
+      prof_events_.assign(2u * device_ops_.size() + 2u, nullptr);
+      for (void*& ev : prof_events_) {
+        hipEvent_t h = nullptr;
+        hipError_t ce = hipEventCreate(&h);
+        if (ce != hipSuccess) {
+          error = std::string("HIP event creation failed: ") + hipGetErrorString(ce);
+          DestroyDeviceState();
+          return false;
+        }
+        ev = static_cast<void*>(h);
+      }
+    }
   }
 
   {
@@ -1194,11 +1278,15 @@ float HipEngine::HalfBitsToFloat(uint16_t h) {
 bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_shape,
                     void* output_data, std::string& error) {
   static const bool trc = [] { const char* e = std::getenv("VSHIP_TRACE"); return e && *e == '1'; }();
-  static uint64_t run_no = 0;
   uint64_t my_no = 0;
-  if (trc) { my_no = ++run_no; fprintf(stderr, "[run] enter #%llu in=%p\n",
-                                       (unsigned long long)my_no, input_data); fflush(stderr); }
   std::lock_guard<std::mutex> lock(mutex_);
+  // Per-engine counters: a function-static counter would be shared across
+  // engines that hold *different* mutexes and would race between them.
+  if (trc) {
+    my_no = ++trace_run_no_;
+    fprintf(stderr, "[run] enter #%llu in=%p\n", (unsigned long long)my_no, input_data);
+    fflush(stderr);
+  }
   // Consume any error left in the thread-local last-error slot by an earlier
   // failed call on this thread (e.g. a reported hipMalloc failure): otherwise
   // the launch check below would misattribute it to this frame's kernel.
@@ -1219,6 +1307,12 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     return false;
   };
 
+  // The public boundary is NCHW for both dtypes; the compute buffers are NHWC.
+  const uint32_t in_n = static_cast<uint32_t>(built_input_shape_[0]);
+  const uint32_t in_c = static_cast<uint32_t>(built_input_shape_[1]);
+  const uint32_t in_h = static_cast<uint32_t>(built_input_shape_[2]);
+  const uint32_t in_w = static_cast<uint32_t>(built_input_shape_[3]);
+
   if (input_is_fp32_) {
     // Raw fp32 upload + on-device cast (no CPU per-pixel conversion).
     std::memcpy(input_staging_f32_, input_data, input_ort_bytes_);
@@ -1230,16 +1324,12 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     // NCHW upload -> NHWC compute buffer: fused transpose + cast.
     // (built_input_shape_ is NCHW; C=1 makes this a plain cast.)
     {
-      const uint32_t iN = static_cast<uint32_t>(built_input_shape_[0]);
-      const uint32_t iC = static_cast<uint32_t>(built_input_shape_[1]);
-      const uint32_t iH = static_cast<uint32_t>(built_input_shape_[2]);
-      const uint32_t iW = static_cast<uint32_t>(built_input_shape_[3]);
       hipLaunchKernelGGL(cast_f32_to_f16_transpose,
-                         dim3(DivCeil(static_cast<uint64_t>(iN) * iH * iW, 256u)),
+                         dim3(DivCeil(static_cast<uint64_t>(in_n) * in_h * in_w, 256u)),
                          dim3(256), 0, stream,
                          static_cast<const float*>(input_f32_dev_),
                          static_cast<_Float16*>(buffers_[input_buffer_].ptr),
-                         iN, iC, iH, iW);
+                         in_n, in_c, in_h, in_w);
       hipError_t e = hipGetLastError();
       if (e != hipSuccess) return run_fail("HIP f32->f16 input cast launch", e);
     }
@@ -1252,6 +1342,22 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
                      input_f32_dev_, buffers_[input_buffer_].ptr);
       }
     }
+  } else if (in_c > 1u) {
+    // fp16 NCHW upload -> NHWC compute buffer: transpose through the scratch.
+    std::memcpy(input_staging_, input_data, input_bytes_);
+    {
+      hipError_t e = hipMemcpyAsync(io_f16_dev_, input_staging_, input_bytes_,
+                                    hipMemcpyHostToDevice, stream);
+      if (e != hipSuccess) return run_fail("HIP input upload", e);
+    }
+    hipLaunchKernelGGL(transpose_f16,
+                       dim3(DivCeil(static_cast<uint64_t>(in_n) * in_c * in_h * in_w, 256u)),
+                       dim3(256), 0, stream,
+                       static_cast<const _Float16*>(io_f16_dev_),
+                       static_cast<_Float16*>(buffers_[input_buffer_].ptr),
+                       in_n, in_c, in_h, in_w, 1u);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return run_fail("HIP NCHW->NHWC input transpose launch", e);
   } else {
     std::memcpy(input_staging_, input_data, input_bytes_);
     hipError_t e = hipMemcpyAsync(buffers_[input_buffer_].ptr, input_staging_, input_bytes_,
@@ -1259,32 +1365,17 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     if (e != hipSuccess) return run_fail("HIP input upload", e);
   }
 
-  // VSHIP_PROFILE=1: per-op GPU timestamps via HIP events.
-  static const bool prof = [] { const char* e = std::getenv("VSHIP_PROFILE"); return e && *e == '1'; }();
-  std::vector<hipEvent_t> ev;
+  // VSHIP_PROFILE=1: per-op GPU timestamps via HIP events, created once per
+  // built plan (in EnsureBuilt). The size check keeps a plan whose events were
+  // not created (variable set after the first frame) from indexing an empty
+  // event list.
+  static const bool prof_env = [] { const char* e = std::getenv("VSHIP_PROFILE"); return e && *e == '1'; }();
+  const size_t kFinalEvent = 2u * device_ops_.size() + 1u;
+  const bool prof = prof_env && prof_events_.size() == kFinalEvent + 1u;
   if (prof) {
-    ev.resize(2u * device_ops_.size() + 2u);
-    for (auto& e : ev) {
-      hipError_t ce = hipEventCreate(&e);
-      if (ce != hipSuccess) {
-        for (auto& d : ev) {
-          if (d) hipEventDestroy(d);
-        }
-        return run_fail("HIP event creation", ce);
-      }
-    }
-    hipError_t re = hipEventRecord(ev[0], stream);
-    if (re != hipSuccess) {
-      for (auto& d : ev) hipEventDestroy(d);
-      return run_fail("HIP event record", re);
-    }
+    hipError_t re = hipEventRecord(static_cast<hipEvent_t>(prof_events_[0]), stream);
+    if (re != hipSuccess) return run_fail("HIP event record", re);
   }
-  // Releases profiling events on any early return.
-  auto destroy_events = [&]() {
-    if (prof) {
-      for (auto& d : ev) hipEventDestroy(d);
-    }
-  };
 
   if (trc) fprintf(stderr, "[run] #%llu cast launched\n", (unsigned long long)my_no), fflush(stderr);
   bool dts_fused_fp32 = false;
@@ -1292,9 +1383,8 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     const auto& dop = device_ops_[dop_i];
     if (trc) fprintf(stderr, "[run] #%llu op%zu type=%d\n", (unsigned long long)my_no, dop_i, (int)dop.type), fflush(stderr);
     if (prof) {
-      hipError_t re = hipEventRecord(ev[1u + 2u * dop_i], stream);
+      hipError_t re = hipEventRecord(static_cast<hipEvent_t>(prof_events_[1u + 2u * dop_i]), stream);
       if (re != hipSuccess) {
-        destroy_events();
         return run_fail("HIP event record", re);
       }
     }
@@ -1342,11 +1432,11 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
       case OpType::DepthToSpace: {
         DtsParams p{};
         std::memcpy(&p, dop.params.data(), sizeof(p));
-        if (output_is_fp32_ && dop.output_buffer == output_buffer_ && p.b == 2u) {
-          // Final-output DTS on an fp32-output model: input-centric pass
-          // writes floats directly, skipping the separate cast over 8M px.
-          // Restricted to blocksize 2, which is what the kernel's whole-block
-          // half4 load and B*B layout implement.
+        if (output_is_fp32_ && dop.output_buffer == output_buffer_ && p.b == 2u && p.c == 1u) {
+          // Final-output DTS on an fp32-output model: input-centric pass writes
+          // floats directly in NCHW, skipping the separate cast over 8M px.
+          // Restricted to blocksize 2 (the whole-block half4 load) and a single
+          // output channel (which is what makes the block contiguous under DCR).
           hipLaunchKernelGGL(dts_kernel_in_f32, dim3(DivCeil(p.w, 32u), DivCeil(p.h, 8u)), dim3(32, 8), 0, stream,
                              static_cast<const _Float16*>(in_bufs[0]), static_cast<float*>(output_f32_dev_), p);
           dts_fused_fp32 = true;
@@ -1364,33 +1454,33 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     {
       hipError_t le = hipGetLastError();
       if (le != hipSuccess) {
-        destroy_events();
         error = "HIP kernel launch for op " + std::to_string(dop_i) + " failed: " +
                 hipGetErrorString(le);
         return false;
       }
     }
     if (prof) {
-      hipError_t re = hipEventRecord(ev[2u + 2u * dop_i], stream);
+      hipError_t re = hipEventRecord(static_cast<hipEvent_t>(prof_events_[2u + 2u * dop_i]), stream);
       if (re != hipSuccess) {
-        destroy_events();
         return run_fail("HIP event record", re);
       }
     }
   }
+
+  // Output shape in NHWC (the parameter maps hold N,H,W,C).
+  std::unordered_map<std::string, std::vector<int64_t>> oshapes;
+  PropagateShapes(built_input_shape_, oshapes);
+  const std::vector<int64_t>& onhwc = oshapes[output_name_];  // N,H,W,C
+  const uint32_t oN = static_cast<uint32_t>(onhwc[0]);
+  const uint32_t oH = static_cast<uint32_t>(onhwc[1]);
+  const uint32_t oW = static_cast<uint32_t>(onhwc[2]);
+  const uint32_t oC = static_cast<uint32_t>(onhwc[3]);
 
   if (output_is_fp32_) {
     // fp16 compute, fp32 download: cast on-device (unless the final DTS
     // already wrote floats), then download floats. NHWC compute buffer ->
     // NCHW download: fused transpose + cast (C=1 is a plain cast).
     if (!dts_fused_fp32) {
-      std::unordered_map<std::string, std::vector<int64_t>> oshapes;
-      PropagateShapes(built_input_shape_, oshapes);
-      const std::vector<int64_t>& onhwc = oshapes[output_name_];  // N,H,W,C
-      const uint32_t oN = static_cast<uint32_t>(onhwc[0]);
-      const uint32_t oH = static_cast<uint32_t>(onhwc[1]);
-      const uint32_t oW = static_cast<uint32_t>(onhwc[2]);
-      const uint32_t oC = static_cast<uint32_t>(onhwc[3]);
       hipLaunchKernelGGL(cast_f16_to_f32_transpose,
                          dim3(DivCeil(static_cast<uint64_t>(oN) * oH * oW, 256u)),
                          dim3(256), 0, stream,
@@ -1399,49 +1489,67 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
                          oN, oC, oH, oW);
       hipError_t le = hipGetLastError();
       if (le != hipSuccess) {
-        destroy_events();
         return run_fail("HIP f16->f32 output cast launch", le);
       }
     }
     hipError_t e = hipMemcpyAsync(output_staging_f32_, output_f32_dev_, output_ort_bytes_,
                                   hipMemcpyDeviceToHost, stream);
     if (e != hipSuccess) {
-      destroy_events();
       return run_fail("HIP fp32 output download", e);
+    }
+  } else if (oC > 1u) {
+    // fp16 multi-channel: NHWC compute buffer -> NCHW download.
+    hipLaunchKernelGGL(transpose_f16,
+                       dim3(DivCeil(static_cast<uint64_t>(oN) * oC * oH * oW, 256u)),
+                       dim3(256), 0, stream,
+                       static_cast<const _Float16*>(buffers_[output_buffer_].ptr),
+                       static_cast<_Float16*>(io_f16_dev_),
+                       oN, oC, oH, oW, 0u);
+    hipError_t le = hipGetLastError();
+    if (le != hipSuccess) {
+      return run_fail("HIP NHWC->NCHW output transpose launch", le);
+    }
+    hipError_t e = hipMemcpyAsync(output_staging_, io_f16_dev_, output_bytes_,
+                                  hipMemcpyDeviceToHost, stream);
+    if (e != hipSuccess) {
+      return run_fail("HIP output download", e);
     }
   } else {
     hipError_t e = hipMemcpyAsync(output_staging_, buffers_[output_buffer_].ptr, output_bytes_,
                                   hipMemcpyDeviceToHost, stream);
     if (e != hipSuccess) {
-      destroy_events();
       return run_fail("HIP output download", e);
     }
   }
   if (prof) {
-    hipError_t re = hipEventRecord(ev[2u * device_ops_.size()], stream);
+    // Separate final-transfer event: re-recording the last op's end event here
+    // would fold the output conversion and download into that op's span.
+    hipError_t re = hipEventRecord(static_cast<hipEvent_t>(prof_events_[kFinalEvent]), stream);
     if (re != hipSuccess) {
-      destroy_events();
       return run_fail("HIP final event record", re);
     }
-    hipError_t se = hipEventSynchronize(ev[2u * device_ops_.size()]);
+    hipError_t se = hipEventSynchronize(static_cast<hipEvent_t>(prof_events_[kFinalEvent]));
     if (se != hipSuccess) {
-      destroy_events();
       return run_fail("HIP profiling event synchronize", se);
     }
     float ms = 0.f;
-    static uint64_t frame_no = 0;
-    const bool report = frame_no++ < 3 || (frame_no % 128 == 0);
+    const bool report = prof_frame_no_++ < 3 || (prof_frame_no_ % 128 == 0);
     if (report) {
-      std::fprintf(stderr, "[vship-prof] frame %llu\n", static_cast<unsigned long long>(frame_no));
+      std::fprintf(stderr, "[vship-prof] frame %llu\n",
+                   static_cast<unsigned long long>(prof_frame_no_));
       for (size_t i = 0; i < device_ops_.size(); ++i) {
         ms = 0.f;
-        hipEventElapsedTime(&ms, ev[1u + 2u * i], ev[2u + 2u * i]);
+        hipEventElapsedTime(&ms, static_cast<hipEvent_t>(prof_events_[1u + 2u * i]),
+                            static_cast<hipEvent_t>(prof_events_[2u + 2u * i]));
         std::fprintf(stderr, "[vship-prof] op%-2zu type=%d %8.3f ms\n",
                      i, static_cast<int>(device_ops_[i].type), ms);
       }
+      float xfer = 0.f;
+      hipEventElapsedTime(&xfer, static_cast<hipEvent_t>(prof_events_[2u * device_ops_.size()]),
+                          static_cast<hipEvent_t>(prof_events_[kFinalEvent]));
+      std::fprintf(stderr, "[vship-prof] output-convert+download %8.3f ms\n", xfer);
       fflush(stderr);
     }
-    destroy_events();
   }
   // Propagate execution failures: without this a kernel fault (or a device
   // loss) still looks like a successful frame over stale staging data.

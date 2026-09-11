@@ -31,6 +31,19 @@ def _session(model, providers=None):
     return ort.InferenceSession(str(model), options, providers=providers or [PROVIDER])
 
 
+def _hip_only_session(model):
+    """Build a session that succeeds only when the HIP EP claims every node.
+
+    ``get_providers()`` still lists the HIP EP on a graph it claimed nothing of,
+    so capability is observed by disabling the CPU fallback: an unclaimed node
+    then makes session creation fail with an explicit error.
+    """
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    return ort.InferenceSession(str(model), options, providers=[PROVIDER])
+
+
 @pytest.fixture(scope="module")
 def hip_session(ep_library, fixtures):
     """A HIP-EP session over the fp32-boundary conv fixture."""
@@ -91,16 +104,13 @@ def test_ep_rebuilds_for_a_new_input_shape(hip_session, ep_case):
     ref.assert_close(got, expected, ref.FP16_CONV_TOL, "EP 4x4 rebuild")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="REVIEW.md P2-11: the EP uploads/downloads multi-channel buffers "
-    "without an NCHW<->NHWC conversion",
-)
-def test_p2_11_multichannel_layout_is_converted(ep_library, fixtures):
-    """Known-open P2 finding, recorded as a test so the fix has a target.
+def test_p2_11_multichannel_output_layout_is_converted(ep_library, fixtures):
+    """REVIEW.md P2-11: the EP's download path must transpose the NHWC compute
+    output into ORT's NCHW tensor. C=1 input (identical layout) with M=8 output
+    isolates the output conversion.
 
-    The marker is ``strict``: when P2-11 is fixed this test XPASSes, which fails
-    the run until the marker is removed -- that is the intended prompt.
+    This check was a strict xfail while the layout conversion was missing; it
+    XPASSed (failing the run) as soon as the conversion was added.
     """
     fx = fixtures.get("conv_c1m8")  # C=1 (input layout identical), M=8 output
     h = w = 16
@@ -109,3 +119,55 @@ def test_p2_11_multichannel_layout_is_converted(ep_library, fixtures):
     got = session.run(None, {"x": x})[0].astype(np.float64)
     expected = ref.conv3x3(x.astype(np.float16), fx.weights, fx.bias)
     ref.assert_close(got, expected, ref.FP16_CONV_TOL, "EP multi-channel output layout")
+
+
+def test_p2_11_multichannel_input_layout_is_converted(ep_library, fixtures):
+    """The upload path needs the same NCHW -> NHWC conversion: three input
+    channels with a single output channel."""
+    fx = fixtures.get("conv_c4m4")
+    h = w = 16
+    x = ref.raw_input(4, h, w, in_fp32=False).reshape(1, 4, h, w)
+    session = _session(fx.model)
+    got = session.run(None, {"x": x})[0].astype(np.float64)
+    expected = ref.conv3x3(x.astype(np.float16), fx.weights, fx.bias)
+    ref.assert_close(got, expected, ref.FP16_CONV_TOL, "EP multi-channel input layout")
+
+
+# ---------------------------------------------------------------------------
+# P2-17: partition boundaries must fit the single-input / single-output engine
+# ---------------------------------------------------------------------------
+
+
+def test_p2_17_two_activation_inputs_are_not_claimed(ep_library, fixtures):
+    """A region with two activation inputs cannot be represented by the compiled
+    graph (which reads input 0), so the EP must refuse it and let ORT fall back
+    instead of running it with one input silently dropped."""
+    fx = fixtures.get("ep_two_inputs")
+    with pytest.raises(Exception, match="fallback"):
+        _hip_only_session(fx.model)
+
+    session = _session(fx.model, providers=[PROVIDER, "CPUExecutionProvider"])
+    h = w = 8
+    x1 = ref.raw_input(4, h, w, in_fp32=False).reshape(1, 4, h, w)
+    x2 = np.ascontiguousarray(x1 + np.float16(0.25))
+    got = session.run(None, {"x1": x1, "x2": x2})[0].astype(np.float64)
+    expected = x1.astype(np.float64) + x2.astype(np.float64)
+    ref.assert_close(got, expected, 1e-3, "fallback result for a two-input region")
+
+
+def test_p2_17_shared_graph_input_is_deduplicated(ep_library, fixtures):
+    """One graph input feeding two convs is a single-activation-input region;
+    appending it twice used to make the run look unsupported."""
+    fx = fixtures.get("ep_two_convs_one_input")
+    h = w = 8
+    x = ref.raw_input(4, h, w, in_fp32=False).reshape(1, 4, h, w)
+
+    hip_only = _hip_only_session(fx.model)  # succeeds only if the EP claims it
+    got = hip_only.run(None, {"x": x})[0].astype(np.float64)
+
+    # Independent reference from the same model on the CPU provider.
+    cpu = _session(fx.model, providers=["CPUExecutionProvider"])
+    expected = cpu.run(None, {"x": x})[0].astype(np.float64)
+    assert got.shape == expected.shape
+    ref.assert_close(got, expected, ref.FP16_CONV_TOL, "deduplicated shared input")
+

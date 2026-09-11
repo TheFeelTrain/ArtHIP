@@ -91,26 +91,28 @@ bool IsNodeSupported(const onnxruntime::GraphViewer& graph, const Node* node) {
     if (attrs.count("group") && attrs.at("group").i() != 1) {
       return false;
     }
-    bool has_pads = false;
-    int pad_h = 0;
-    int pad_w = 0;
+    // The kernel implements symmetric 1-padding on both axes only. ONNX pads
+    // are [top, left, bottom, right]; reading indices 0 and 2 as (h, w) would
+    // accept [1,0,1,0] and compile a different convolution, and a pad-0 Conv
+    // would be claimed here only to fail CompileGraph and break the session.
+    bool pads_ok = false;
     if (attrs.count("pads")) {
       const auto& a = attrs.at("pads");
-      if (a.ints_size() >= 4) {
-        pad_h = static_cast<int>(a.ints(0));
-        pad_w = static_cast<int>(a.ints(2));
-        has_pads = true;
+      if (a.ints_size() != 4 || a.ints(0) != 1 || a.ints(1) != 1 || a.ints(2) != 1 ||
+          a.ints(3) != 1) {
+        return false;
       }
+      pads_ok = true;
     }
     if (attrs.count("auto_pad")) {
       const std::string auto_pad = attrs.at("auto_pad").s();
       if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
-        pad_h = 1;
-        pad_w = 1;
-        has_pads = true;
+        pads_ok = true;
+      } else if (auto_pad != "NOTSET") {
+        return false;  // VALID etc. mean no padding, which the kernel cannot do
       }
     }
-    if (has_pads && (pad_h != 1 || pad_w != 1)) {
+    if (!pads_ok) {
       return false;
     }
 
@@ -127,6 +129,31 @@ bool IsNodeSupported(const onnxruntime::GraphViewer& graph, const Node* node) {
     const auto& dims = tensor_proto->dims();
     if (dims.size() != 4 || dims[2] != 3 || dims[3] != 3) {
       return false;
+    }
+  }
+
+  if (optype == "DepthToSpace") {
+    const auto& attrs = node->GetAttributes();
+    if (attrs.count("mode") && attrs.at("mode").s() != "DCR") {
+      return false;
+    }
+    if (attrs.count("blocksize") && attrs.at("blocksize").i() < 1) {
+      return false;
+    }
+  }
+
+  if (optype == "Clip") {
+    // Input-form bounds (opset >= 11) must be initializers: the EP cannot
+    // evaluate a dynamic bound and would otherwise substitute a default.
+    auto defs = node->InputDefs();
+    for (size_t i = 1; i < defs.size(); ++i) {
+      if (defs[i] == nullptr || !defs[i]->Exists()) {
+        continue;
+      }
+      const ONNX_NAMESPACE::TensorProto* tensor_proto = nullptr;
+      if (!graph.GetInitializedTensor(defs[i]->Name(), tensor_proto)) {
+        return false;
+      }
     }
   }
 
@@ -187,9 +214,38 @@ HipExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer
   }
 
   static std::atomic<int> metadef_id{0};
+
+  // Tensors declared as graph outputs must be exported even when a node inside
+  // the partition also consumes them.
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto* go : graph_viewer.GetOutputs()) {
+    if (go != nullptr && go->Exists()) {
+      graph_outputs.insert(go->Name());
+    }
+  }
+  // Whole-graph consumer count per tensor: an output consumed both inside and
+  // outside a run has to be produced by the run and exported for the outside
+  // consumers.
+  std::unordered_map<std::string, int> total_consumers;
+  for (const auto& node_idx : nodes_in_order) {
+    const Node* node = graph_viewer.GetNode(node_idx);
+    if (node == nullptr) {
+      continue;
+    }
+    for (const auto* in : node->InputDefs()) {
+      if (in != nullptr && in->Exists()) {
+        total_consumers[in->Name()]++;
+      }
+    }
+  }
+  auto is_initializer = [&graph_viewer](const std::string& name) {
+    const ONNX_NAMESPACE::TensorProto* tensor_proto = nullptr;
+    return graph_viewer.GetInitializedTensor(name, tensor_proto);
+  };
+
   for (auto& run : runs) {
     std::unordered_set<std::string> produced;
-    std::unordered_set<std::string> consumed;
+    std::unordered_map<std::string, int> consumed_inside;
     for (const auto& node_idx : run) {
       const Node* node = graph_viewer.GetNode(node_idx);
       for (const auto* out : node->OutputDefs()) {
@@ -202,9 +258,55 @@ HipExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer
       const Node* node = graph_viewer.GetNode(node_idx);
       for (const auto* in : node->InputDefs()) {
         if (in != nullptr && in->Exists()) {
-          consumed.insert(in->Name());
+          consumed_inside[in->Name()]++;
         }
       }
+    }
+
+    // External activations (deduplicated), initializer-backed constants, and
+    // exported outputs. The engine's compiled representation supports exactly
+    // one activation input and one output, so a run with anything else is left
+    // to another provider instead of being claimed and mis-run.
+    std::vector<std::string> activations;
+    std::vector<std::string> constants;
+    std::vector<std::string> outputs;
+    {
+      std::unordered_set<std::string> seen_act, seen_const, seen_out;
+      for (const auto& node_idx : run) {
+        const Node* node = graph_viewer.GetNode(node_idx);
+        for (const auto* in : node->InputDefs()) {
+          if (in == nullptr || !in->Exists()) {
+            continue;
+          }
+          const std::string& name = in->Name();
+          if (produced.count(name)) {
+            continue;
+          }
+          if (is_initializer(name)) {
+            if (seen_const.insert(name).second) constants.push_back(name);
+          } else if (seen_act.insert(name).second) {
+            activations.push_back(name);
+          }
+        }
+        for (const auto* out : node->OutputDefs()) {
+          if (out == nullptr || !out->Exists()) {
+            continue;
+          }
+          const std::string& name = out->Name();
+          const int inside = consumed_inside.count(name) ? consumed_inside[name] : 0;
+          const int total = total_consumers.count(name) ? total_consumers[name] : 0;
+          const bool needed_outside = (total > inside) || graph_outputs.count(name) != 0;
+          if (!needed_outside) {
+            continue;
+          }
+          if (seen_out.insert(name).second) outputs.push_back(name);
+        }
+      }
+    }
+    if (activations.size() != 1 || outputs.size() != 1) {
+      // Multi-input / multi-output / branched regions cannot be represented by
+      // the compiled graph (which reads input 0 and writes output 0).
+      continue;
     }
 
     auto sub_graph = onnxruntime::IndexedSubGraph::Create();
@@ -215,18 +317,16 @@ HipExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer
     meta_def->name() = "HipKernel_graph_" + std::to_string(metadef_id.fetch_add(1));
     meta_def->domain() = kMSDomain;
     meta_def->since_version() = 1;
-    for (const auto& node_idx : run) {
-      const Node* node = graph_viewer.GetNode(node_idx);
-      for (const auto* in : node->InputDefs()) {
-        if (in != nullptr && in->Exists() && produced.count(in->Name()) == 0) {
-          meta_def->inputs().push_back(in->Name());
-        }
-      }
-      for (const auto* out : node->OutputDefs()) {
-        if (out != nullptr && out->Exists() && consumed.count(out->Name()) == 0) {
-          meta_def->outputs().push_back(out->Name());
-        }
-      }
+    // The activation is input 0; initializer-backed constants follow (the fused
+    // graph keeps needing them to read weights).
+    for (const auto& name : activations) {
+      meta_def->inputs().push_back(name);
+    }
+    for (const auto& name : constants) {
+      meta_def->inputs().push_back(name);
+    }
+    for (const auto& name : outputs) {
+      meta_def->outputs().push_back(name);
     }
     sub_graph->SetMetaDef(std::move(meta_def));
     result.push_back(ComputeCapability::Create(std::move(sub_graph)));

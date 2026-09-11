@@ -31,13 +31,14 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
 
 ## P1 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 1-9
 
-All nine [P1] findings from REVIEW.md are fixed in the tree; P2/performance
-items are untouched and still open. The engine/EP now REJECT what they cannot
-compute correctly instead of reading out of bounds or silently under-writing.
-Verified by the correctness suite (`tests/correctness/`, run with
+All nine [P1] findings from REVIEW.md are fixed in the tree (the nine [P2]
+findings were fixed in the follow-up session — see the P2 section below; the
+performance items from the review are still open). The engine/EP now REJECT
+what they cannot compute correctly instead of reading out of bounds or silently
+under-writing. Verified by the correctness suite (`tests/correctness/`, run with
 `python tests/correctness/run.py`): engine fixtures vs numpy references, EP vs
-the ONNX reference, plugin via vspipe — 62 checks + 1 strict xfail for the
-still-open EP multi-channel layout (P2-11). The same checks fail against
+the ONNX reference, plugin via vspipe — 62 checks at the time of these fixes
+(the suite has grown since; see the P2 section). The same checks fail against
 pre-fix builds (10 of them), so they demonstrate the bugs rather than merely
 passing. The plugin suite also runs all three shipped models, including the
 chroma model (3 planes -> 2 chroma planes) whose U/V outputs are compared
@@ -108,6 +109,105 @@ HIP-vs-CPU 0.00098 = MIGX-vs-CPU 0.00098. Paired 100f: base hip 21.6-21.9 vs
 migx 14.7, chroma hip 22.0 vs migx 19.1 — unchanged from the pre-fix build, so
 the added validation costs nothing measurable.
 
+## P2 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 10-18
+
+All nine [P2] findings are fixed in the tree. The correctness suite is now 82
+checks (48 engine / 8 EP / 26 plugin) and passes; the strict xfail that tracked
+the EP multi-channel layout (P2-11) was removed because that check now passes.
+Every fix has a regression check named after its finding, and 17 of the 18 new
+P2 checks FAIL against a stashed pre-P2 build (the 18th, "frame-sized tilesize
+is accepted", passes on both — it guards against over-strict rejection).
+
+- **#10 DTS DCR + fp32 tail layout.** Every DTS kernel used CRD order
+  (`c*B*B + r*B + q`); ONNX DCR requires `(r*B + q)*Cout + c`. They coincide for
+  Cout==1, which is why the luma tail hid the defect. All three kernels now use
+  DCR. `dts_kernel_in_f32` (input-centric fp32 fast path) is now restricted to
+  b==2 AND Cout==1 — only then is the whole-block half4 load contiguous under
+  DCR — and writes NCHW, so the caller can skip the output transpose. Fixtures
+  with Cout=2, b=2/3 and fp16/fp32 outputs are exact.
+- **#11 fp16 multi-channel layout (engine + plugin + EP).** The engine's public
+  boundary is now NCHW plane-major for BOTH IO dtypes (it was NHWC for fp16,
+  NCHW for fp32), matching its documented contract. fp16 IO with C>1 is
+  transposed on-device by a new `transpose_f16` in `hip_kernels.h` (shared with
+  the EP); C==1 skips it, so the shipped luma path is untouched. The plugin packs
+  plane-major for every dtype/path; the EP uploads/downloads through the same
+  kernel, so its multi-channel support is real instead of silently mis-laid-out.
+- **#12 integer/half clip -> fp32 model.** Packing branches on the engine dtype
+  as well as the clip dtype: an int or half clip feeding an fp32-input model is
+  widened to float (it wrote 2 bytes/element into a 4-byte buffer). GRAY8 128
+  reaches the model as 0.50195 (was ~3.15e-5).
+- **#13 fusion vs other consumers (both engines).** SiLU, residual-Add and
+  DTS->Clip fusion require the renamed tensor to have no consumer besides the
+  nodes being folded and to not be a graph output; the Add fusion also requires
+  distinct operands. `raw=conv(x); z=raw*sigmoid(raw); y=raw+z` now runs (it
+  used to lose `raw`), and a residual whose conv output feeds another op is no
+  longer renamed away. The shipped models still fuse everything: 28 device ops
+  each (27 conv + tail), unchanged.
+- **#14 Conv pads / Clip bounds (both engines).** ONNX pads are
+  [top,left,bottom,right] and the kernel only implements symmetric 1-padding, so
+  all four entries must be 1 (`[1,0,1,0]` was compiled as full padding with the
+  wrong output shape). Clip bounds default to the element type's extrema
+  (+/-inf), not [0,1], in both the attribute and input forms; a non-initializer
+  (dynamic) bound is rejected. The EP capability predicate rejects the same
+  cases so they fall back instead of failing Compile.
+- **#15 options (vs_hip.cpp).** Omitted `fp16` keeps its documented `true`
+  default (mapGetIntSaturated's error flag, not its 0 return). `overlap` /
+  `tilesize` are read: the no-tiling default (absent, zero overlap, frame-sized
+  tilesize) is accepted, anything else is rejected explicitly — there is no
+  tiling path.
+- **#16 flexible num_planes.** Comes from the propagated final output shape
+  instead of the tail Conv's M: the luma model (4 tail channels -> DTS) reports
+  1 plane, matching the frame it produces.
+- **#17 EP partition boundaries.** External inputs are deduplicated; an output
+  is exported whenever it has a consumer outside the run or is a graph output
+  (consumers counted per edge). A run is claimed only with exactly one
+  activation input and one output; everything else falls back rather than being
+  run with input 0 / output 0 only. Unsupported Conv pads, non-DCR DepthToSpace
+  and dynamic Clip bounds now fail the capability predicate, not Compile.
+- **#18 profiling events.** A separate final-transfer event (2*ops+1) is
+  recorded after the output conversion/download, so the last op's span no longer
+  absorbs it and the transfer has its own printed span. Events are created once
+  per built plan (freed in DestroyDeviceState) and the trace/frame counters are
+  per-engine instead of function-static (they raced across engines, each holding
+  a different mutex).
+
+Gate after the P2 fixes (RX 7900 XTX): photo `tests/test_1920.png` GRAYS -> 2x,
+HIP vs MIGX max absdiff **0.002441** (= the documented 0.0024, unchanged); 200
+blank 1080p frames hip **22.3 fps** vs migx 8.4; EP `multires.py 256`
+HIP-vs-CPU 0.00098 (= MIGX-vs-CPU) at 1.78 ms/iter vs MIGX 2.57; suite 82/82.
+
+**NOT from the review — intermittent chroma corruption (OPEN, pre-existing).**
+While validating #11 the chroma probe (3 planes -> 2, fp32 clip, 64x64) produced
+a corrupted frame: 3-5% of pixels off by 0.02-0.11, scattered over the whole
+plane, different garbage each process but bit-identical for repeated frames
+*within* one process. Rate is low and variable (~1/29 with the P2 build, ~1/37
+with a stashed pre-P2 build, 0/80 in another P2 run), so it is NOT a P2
+regression — the same binary produces good or bad output at random. That
+signature (per-process variation, in-process repeatability) points at reading
+state that was never written (LDS or device memory), not at a missing barrier in
+the winograd kernel (audited: strip and v_lds coverage is complete; the only
+unwritten bytes are the 4-half v_lds row padding and unwritten small-M tail
+channels, neither of which any store consumes). Reproducer:
+`tmp/p2probe/find.py` (loops until a bad chroma frame appears; ~30 runs).
+Next step: bisect by dumping an intermediate tensor (VSHIP_DEBUG device-op
+indices + a tensor readback) on a bad run, or run the same input repeatedly
+inside one process with `rocprofv2` LDS counters.
+
+Determinism measured the same session (direct plugin, `core.hip.Model`, one
+frame per process, SHA-256 of the plane):
+- luma, 1920x1080 photo -> 3840x2160: **12/12 bit-identical** (6 runs at
+  num_streams=1 and 6 at num_streams=2).
+- luma, 1920x1080 BLANK -> fp16: 2/6 and 2/8 runs differ, but only by 3.05e-5
+  (= 1 fp16 ULP, subnormal) at ~1400 pixels where the output is ~1e-5. Harmless
+  rounding at the very bottom of the range, not corruption.
+- Going through vsscale's `ArtCNN.R8F64` (which TILES the frame and calls
+  `core.hip.Model` per tile) adds up to ~0.03 differences at a few tile-seam
+  clusters, HIP-vs-HIP, while the same plugin called directly is identical. So
+  that layer — not ArtHIP — is what makes the vsscale-based "photo vs MIGX"
+  gate noisy; the documented 0.002441 shows up when the wrapper happens to agree
+  with itself. Prefer direct `core.hip.Model` comparisons for accuracy gates
+  until that is explained.
+
 ## VapourSynth API4 port (2026-09-10, SHIPPED)
 
 vs_hip.cpp moved from API3 to API4 (`VapourSynthPluginInit2` / `configPlugin` /
@@ -127,9 +227,15 @@ outputs BIT-IDENTICAL to the API3 build (chroma 320px: max 0.0095/0.0083 vs
 MIGX; base real jpbd luma 0.00097; dehalo RGBS 0.0034/0.0044/0.0039, 0% > 0.02).
 All input paths re-checked: GRAY8/GRAY16/GRAYH/GRAYS in, GRAYH/GRAYS out,
 num_streams 1-2, Version/DeviceProperties, 0-clip + missing-path errors clean.
-PRE-EXISTING (unchanged by the port, present in API3 too): fp16=0 leaves the
-model fp32, which the fp16 winograd engine cannot consume — output is ~0 and
-GRAYS (api4_paths.py shows maxdiff 1.0 vs fp16=1). Do not use fp16=0.
+fp16=0 status (CORRECTED 2026-09-10 in the P2 session; the old "output is ~0,
+do not use fp16=0" claim was stale — REVIEW.md P2-12 had already flagged it, and
+`WeightFloat()` reads fp32 weight storage fine). Measured on the shipped models
+with fp16=0 vs fp16=1: luma GRAY8 -> Gray16 vs GrayH, means identical; chroma
+YUV444PS -> GrayS both, means within 5e-5; dehalo YUV444PS -> RGBS both, means
+within 2e-4. The concrete fp16=0 defect was narrower: an INTEGER or HALF clip
+feeding an fp32-input model wrote 2 bytes/element into a 4-byte buffer (GRAY8
+128 arrived as ~3e-5). Fixed by P2-12 (packing now branches on the engine's
+dtype too); `test_p2_12_integer_clip_into_fp32_model` gates it.
 
 ## ROADMAP — occupancy & latency (next working session)
 
@@ -238,15 +344,23 @@ FAILED / REVERTED (do not blind-retry):
 
 ## OPEN QUESTIONS
 
-- RARE luma nondeterminism (observed 2026-09-10, NOT reproduced): one luma
-  320x180 run out of ~17 differed from every other run by up to 0.0041
-  (mostly ~3e-6 = fp16 rounding) in a localized 17x32 block; 23 later runs,
-  including 6 under concurrent verify_ep/verify_plugin GPU load, were
-  bit-identical. The devop dump/dispatch was identical, and rebuilding the
-  same source reproduced the majority result, so this is NOT a regression
-  from the P1 fixes. It matches the unverified "races" item in REVIEW.md —
-  treat a future occurrence as a real GPU-side race and capture the frame
-  plus a counter pass rather than dismissing it.
+- RARE nondeterminism — NOW REPRODUCIBLE (2026-09-10 P2 session), still open.
+  Original sighting: one luma 320x180 run out of ~17 differed from every other
+  run by up to 0.0041 (mostly ~3e-6 = fp16 rounding) in a localized 17x32 block.
+  Reproduction: the chroma probe (3 planes in, 2 out, fp32 clip, 64x64, fixed
+  seed) yields a corrupted frame every ~30 runs — 3-5% of pixels off by
+  0.02-0.11, scattered, different values per process, but bit-identical for two
+  frames fetched from the same process. Seen at ~1/37 with a stashed PRE-P2
+  build, ~1/29 with the P2 build, and 0/80 in a follow-up run of the P2 build,
+  so it predates the P2 fixes and sits somewhere under ~3%. Signature =
+  reading state that was never written (per-process VRAM/LDS contents), not a
+  missing barrier (the winograd barriers and LDS coverage were audited; the only
+  unwritten bytes are the 4-half v_lds row padding and unwritten small-M tail
+  channels, neither of which is stored). Note (same session): the DIRECT plugin
+  is bit-deterministic on a 1080p photo (12/12), so this is not a general
+  determinism failure; it is a rare, input/shape-specific corruption. Next step:
+  capture the bad frame, then dump an intermediate tensor on a bad run or use
+  `rocprofv2` LDS counters. Repro: `tmp/p2probe/find.py`.
 - Actual resident waves/SIMD for winograd_conv (rocprofv2) — 3 predicted
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
 - Why did vs_ab_check segfault intermittently at teardown in 4-backend

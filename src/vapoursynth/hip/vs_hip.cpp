@@ -8,13 +8,20 @@
 //                   num_streams, fp16)
 //   - accepts GRAY8 / GRAY16 / GRAYH (fp16) / GRAYS (fp32) input; fp32 clips
 //     with an fp32-io model are passed through raw (the engine converts on
-//     the host inside Run); everything else is packed to fp16 [0,1] bits here
+//     the host inside Run); everything else is packed to fp16 [0,1] here
+//   - planes are packed plane-major (NCHW) in the engine's element type; the
+//     engine transposes to its internal NHWC layout on-device, for fp16 and
+//     fp32 IO alike
 //   - compute is fp16; the output format follows the model IO like the MIGX
 //     plugin: GRAYS (fp32) for fp32 clips, GRAYH (fp16 [0,1]) otherwise, at
 //     2x the input size (model-defined); GRAY16 when fp16=false
 //   - fp16=true (default) converts fp32 models to fp16 at load time
 //   - num_streams engines run round-robin so concurrent frame requests
 //     overlap (fmParallel-safe; each engine owns its stream + mutex)
+//   - overlap/tilesize exist for vs-mlrt API compatibility; this filter always
+//     processes the whole frame in one tile, so only the no-tiling default
+//     (absent, or a zero overlap / frame-sized tilesize) is accepted and any
+//     other value is rejected instead of silently ignored
 //
 // VapourSynth API4 (VapourSynthPluginInit2 / createVideoFilter). The model is
 // loaded, probed and the output VSVideoInfo resolved in hipCreate (the API4
@@ -137,11 +144,15 @@ static const VSFrame* VS_CC hipGetFrame(
                           d->output_fp32 ? 32 : 16, 0, 0, core);
   dst = vsapi->newVideoFrame(&out_fmt, out_w, out_h, src, core);
 
-  // Pack the source frame into a contiguous host buffer. fp32 clips on
-  // fp32-input models pass through raw; everything else becomes fp16 [0,1].
+  // Pack the source frame into a contiguous host buffer in NCHW plane-major
+  // order, in the element type the engine's input boundary expects: raw fp32
+  // for fp32-input models, fp16 [0,1] otherwise. The engine casts/transposes
+  // to its internal NHWC layout on-device. Branching on the engine dtype here
+  // matters: an integer or half clip feeding an fp32-input model must be
+  // widened to float, not written as two-byte halfs into a four-byte buffer.
   const bool host_fp32 = eng->InputIsFp32();
-  const size_t in_elem = host_fp32 ? 4 : 2;
-  std::vector<uint8_t> in_pack(static_cast<size_t>(in_w) * in_h * in_c * in_elem);
+  const size_t in_plane = static_cast<size_t>(in_w) * in_h;
+  std::vector<uint8_t> in_pack(in_plane * in_c * (host_fp32 ? 4 : 2));
 
   const uint8_t* src_ptrs[3] = {nullptr, nullptr, nullptr};
   ptrdiff_t src_strides[3] = {0, 0, 0};
@@ -149,73 +160,64 @@ static const VSFrame* VS_CC hipGetFrame(
     src_ptrs[p] = vsapi->getReadPtr(src, p);
     src_strides[p] = vsapi->getStride(src, p);
   }
+  float* dst_f32 = host_fp32 ? reinterpret_cast<float*>(in_pack.data()) : nullptr;
+  uint16_t* dst_f16 = host_fp32 ? nullptr : reinterpret_cast<uint16_t*>(in_pack.data());
+  auto store = [&](int c, int y, int x, float v) {
+    const size_t idx = static_cast<size_t>(c) * in_plane + static_cast<size_t>(y) * in_w + x;
+    if (host_fp32) {
+      dst_f32[idx] = v;
+    } else {
+      uint16_t h;
+      vship::HipEngine::FloatToHalfBitsRNE(v, h);
+      dst_f16[idx] = h;
+    }
+  };
   switch (fmt->sampleType) {
     case stInteger: {
-      // Rare path (GRAY8/16 sources): scale + RNE convert to fp16.
-      if (fmt->bitsPerSample == 8) {
-        const float scale = 1.0f / 255.0f;
+      // Rare path (GRAY8/16 sources): scale + RNE convert.
+      const bool b8 = fmt->bitsPerSample == 8;
+      const float scale = b8 ? 1.0f / 255.0f : 1.0f / 65535.0f;
+      for (int c = 0; c < in_c; ++c) {
         for (int y = 0; y < in_h; ++y) {
-          auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w * in_c;
-          for (int x = 0; x < in_w; ++x)
-            for (int c = 0; c < in_c; ++c) {
-              const uint8_t* row = src_ptrs[c] + y * src_strides[c];
-              uint16_t h;
-              vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
-              dst_row[x * in_c + c] = h;
-            }
-        }
-      } else {
-        const float scale = 1.0f / 65535.0f;
-        for (int y = 0; y < in_h; ++y) {
-          auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w * in_c;
-          for (int x = 0; x < in_w; ++x)
-            for (int c = 0; c < in_c; ++c) {
-              const uint16_t* row = reinterpret_cast<const uint16_t*>(src_ptrs[c] + y * src_strides[c]);
-              uint16_t h;
-              vship::HipEngine::FloatToHalfBitsRNE(row[x] * scale, h);
-              dst_row[x * in_c + c] = h;
-            }
+          const uint8_t* row = src_ptrs[c] + static_cast<ptrdiff_t>(y) * src_strides[c];
+          const uint16_t* row16 = reinterpret_cast<const uint16_t*>(row);
+          for (int x = 0; x < in_w; ++x) {
+            store(c, y, x, (b8 ? row[x] : row16[x]) * scale);
+          }
         }
       }
       break;
     }
     case stFloat: {
       if (fmt->bitsPerSample == 16) {  // fp16, already [0,1]
-        for (int y = 0; y < in_h; ++y) {
-          auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w * in_c;
-          for (int x = 0; x < in_w; ++x)
-            for (int c = 0; c < in_c; ++c) {
-              const uint16_t* row = reinterpret_cast<const uint16_t*>(src_ptrs[c] + y * src_strides[c]);
-              dst_row[x * in_c + c] = row[x];
+        if (!host_fp32) {
+          // Same element type and same (plane-major) layout: one row copy.
+          for (int c = 0; c < in_c; ++c) {
+            for (int y = 0; y < in_h; ++y) {
+              const uint8_t* row = src_ptrs[c] + static_cast<ptrdiff_t>(y) * src_strides[c];
+              std::memcpy(dst_f16 + static_cast<size_t>(c) * in_plane +
+                              static_cast<size_t>(y) * in_w,
+                          row, static_cast<size_t>(in_w) * 2);
             }
-        }
-      } else if (host_fp32) {
-        // fp32 raw pass-through in ORT NCHW order (plane-major): the engine
-        // uploads + casts into its NCHW fp32 mirror, then transposes to the
-        // NHWC compute buffer on-device. (C=1: identical to interleaved.)
-        for (int c = 0; c < in_c; ++c) {
-          float* dst_plane = reinterpret_cast<float*>(in_pack.data()) +
-                             static_cast<size_t>(c) * in_h * in_w;
-          for (int y = 0; y < in_h; ++y) {
-            const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
-            std::memcpy(dst_plane + static_cast<size_t>(y) * in_w, row,
-                        static_cast<size_t>(in_w) * 4);
+          }
+        } else {
+          for (int c = 0; c < in_c; ++c) {
+            for (int y = 0; y < in_h; ++y) {
+              const uint16_t* row =
+                  reinterpret_cast<const uint16_t*>(src_ptrs[c] + static_cast<ptrdiff_t>(y) * src_strides[c]);
+              for (int x = 0; x < in_w; ++x) {
+                store(c, y, x, vship::HipEngine::HalfBitsToFloat(row[x]));
+              }
+            }
           }
         }
-      } else {  // fp32 source into an fp16-input model: precision convert
-        for (int y = 0; y < in_h; ++y) {
-          auto* dst_row = reinterpret_cast<uint16_t*>(in_pack.data()) +
-                          static_cast<size_t>(y) * in_w * in_c;
-          for (int x = 0; x < in_w; ++x)
-            for (int c = 0; c < in_c; ++c) {
-              const float* row = reinterpret_cast<const float*>(src_ptrs[c] + y * src_strides[c]);
-              uint16_t h;
-              vship::HipEngine::FloatToHalfBitsRNE(row[x], h);
-              dst_row[x * in_c + c] = h;
-            }
+      } else {  // fp32 source: raw pass-through or precision convert
+        for (int c = 0; c < in_c; ++c) {
+          for (int y = 0; y < in_h; ++y) {
+            const float* row =
+                reinterpret_cast<const float*>(src_ptrs[c] + static_cast<ptrdiff_t>(y) * src_strides[c]);
+            for (int x = 0; x < in_w; ++x) store(c, y, x, row[x]);
+          }
         }
       }
       break;
@@ -349,6 +351,22 @@ static const VSFrame* VS_CC hipGetFrame(
         row[x] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
       }
     }
+    // 3-channel integer output is an RGB48 frame: fill the other two planes
+    // too (the engine's NCHW buffer has one plane per output channel).
+    if (rgb_planes) {
+      for (int c = 1; c < 3; ++c) {
+        uint8_t* pptr = vsapi->getWritePtr(dst, c);
+        const ptrdiff_t pstride = vsapi->getStride(dst, c);
+        const uint16_t* plane = &out_fp16[static_cast<size_t>(c) * plane_px];
+        for (int y = 0; y < out_h; ++y) {
+          uint16_t* row = reinterpret_cast<uint16_t*>(pptr + y * pstride);
+          for (int x = 0; x < out_w; ++x) {
+            const float v = vship::HipEngine::HalfBitsToFloat(plane[static_cast<size_t>(y) * out_w + x]);
+            row[x] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+          }
+        }
+      }
+    }
   }
 
   vsapi->freeFrame(src);
@@ -437,7 +455,43 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
   d->device_id = vsapi->mapGetIntSaturated(in, "device_id", 0, &err);
   d->num_streams = vsapi->mapGetIntSaturated(in, "num_streams", 0, &err);
   if (d->num_streams < 1) d->num_streams = 1;
-  d->output_fp16 = !!vsapi->mapGetIntSaturated(in, "fp16", 0, &err);
+  // fp16 defaults to true: mapGetIntSaturated returns 0 and sets its error flag
+  // for an absent optional, so the flag (not the value) decides the default.
+  {
+    int ferr = 0;
+    const int64_t v = vsapi->mapGetIntSaturated(in, "fp16", 0, &ferr);
+    d->output_fp16 = (ferr == 0) ? (v != 0) : true;
+  }
+
+  // overlap/tilesize are part of the vs-mlrt filter signature. This filter has
+  // no tiling path, so accept only the documented no-tiling default (absent,
+  // zero overlap, or a tilesize equal to the frame) and reject anything else
+  // rather than silently running full-frame inference.
+  {
+    int ow_err = 0, oh_err = 0, tw_err = 0, th_err = 0;
+    const int64_t ov_w = vsapi->mapGetIntSaturated(in, "overlap", 0, &ow_err);
+    const int64_t ov_h = vsapi->mapGetIntSaturated(in, "overlap", 1, &oh_err);
+    const int64_t ts_w = vsapi->mapGetIntSaturated(in, "tilesize", 0, &tw_err);
+    const int64_t ts_h = vsapi->mapGetIntSaturated(in, "tilesize", 1, &th_err);
+    const int64_t overlap_w = (ow_err == 0) ? ov_w : 0;
+    const int64_t overlap_h = (oh_err == 0) ? ov_h : overlap_w;
+    if (overlap_w < 0 || overlap_h < 0) {
+      fail("\"overlap\" must be non-negative");
+      return;
+    }
+    if (overlap_w != 0 || overlap_h != 0) {
+      fail("\"overlap\" is not supported: this filter always processes the whole frame in one tile");
+      return;
+    }
+    if (tw_err == 0) {
+      const int64_t tile_w = ts_w;
+      const int64_t tile_h = (th_err == 0) ? ts_h : tile_w;
+      if (tile_w != d->vi->width || tile_h != d->vi->height) {
+        fail("\"tilesize\" is not supported: this filter always processes the whole frame in one tile");
+        return;
+      }
+    }
+  }
 
   auto load_result = loadONNX(network_path, 0, 0, false);
   if (std::holds_alternative<std::string>(load_result)) {
@@ -471,8 +525,6 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
     }
     d->engines.push_back(e);
   }
-  d->output_channels = d->engines[0]->OutputChannels();
-  if (d->output_channels < 1) d->output_channels = 1;
   d->output_fp32 = d->engines[0]->OutputIsFp32();
   d->input_channels = d->engines[0]->InputChannels();
   if (d->input_channels < 1) d->input_channels = 1;
@@ -499,6 +551,12 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
     return;
   }
 
+  // The published plane count must be the graph's final output channels, i.e.
+  // after any trailing DepthToSpace - not the tail Conv's M, which is what a
+  // 4-channel-then-DTS model would otherwise report (4 planes vs 1 produced).
+  d->output_channels = static_cast<int>(probe_out[1]);
+  if (d->output_channels < 1) d->output_channels = 1;
+
   const int in_w = d->vi->width;
   const int in_h = d->vi->height;
   const int scale_w = static_cast<int>(probe_out[3] / probe_in[3]);
@@ -506,7 +564,7 @@ static void VS_CC hipCreate(const VSMap* in, VSMap* out, void* userData, VSCore*
 
   // Mirror the GetFrame rule: 3-channel non-flex output is RGB (vsmigx
   // setDimensions maps C==3 non-flex to cfRGB).
-  const int decl_out_c = static_cast<int>(probe_out[1]);
+  const int decl_out_c = d->output_channels;
   const bool decl_flex = !d->flexible_prop.empty();
   d->out_vi = *d->vi;
   d->out_vi.width = in_w * scale_w;

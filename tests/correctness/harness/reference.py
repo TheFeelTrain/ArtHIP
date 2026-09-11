@@ -33,8 +33,9 @@ def ramp(numel: int) -> np.ndarray:
 def raw_input(c: int, h: int, w: int, in_fp32: bool) -> np.ndarray:
     """Flat host buffer in the layout ``HipEngine::Run`` expects.
 
-    fp32-input models take NCHW; fp16-input models take NHWC (the engine's
-    compute buffers are NHWC and the plugin packs accordingly).
+    The engine's boundary is NCHW plane-major for both IO dtypes (it transposes
+    to its internal NHWC compute layout on-device), so the flat ramp *is* the
+    NCHW memory order in either case.
     """
     flat = ramp(c * h * w)
     return flat.astype(np.float32) if in_fp32 else flat.astype(np.float16)
@@ -50,27 +51,17 @@ def logical_input(c: int, h: int, w: int, in_fp32: bool) -> np.ndarray:
     flat = ramp(c * h * w)
     if in_fp32:
         return flat.reshape(1, c, h, w).astype(np.float64)
-    half = flat.astype(np.float16)
-    return half.reshape(1, h, w, c).transpose(0, 3, 1, 2).astype(np.float64)
+    return flat.reshape(1, c, h, w).astype(np.float16).astype(np.float64)
 
 
 def decode_output(buf: bytes, shape_nchw, out_fp32: bool) -> np.ndarray:
     """Decode a host output buffer into a logical NCHW float64 tensor.
 
-    The engine returns fp32 outputs in NCHW but fp16 outputs in NHWC (a
-    documented engine boundary quirk, REVIEW.md P2-11). Channel counts above
-    one therefore decode differently per dtype; update this helper together
-    with that finding.
+    Both IO dtypes are NCHW at the engine boundary, so one reshape covers both.
     """
     n, c, h, w = (int(v) for v in shape_nchw)
-    if out_fp32:
-        return np.frombuffer(buf, dtype=np.float32).reshape(n, c, h, w).astype(np.float64)
-    return (
-        np.frombuffer(buf, dtype=np.float16)
-        .reshape(n, h, w, c)
-        .transpose(0, 3, 1, 2)
-        .astype(np.float64)
-    )
+    dtype = np.float32 if out_fp32 else np.float16
+    return np.frombuffer(buf, dtype=dtype).reshape(n, c, h, w).astype(np.float64)
 
 
 def conv3x3(x: np.ndarray, weight: np.ndarray, bias: np.ndarray | None = None, pad: int = 1) -> np.ndarray:

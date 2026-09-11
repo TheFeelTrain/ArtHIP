@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,8 +44,12 @@ struct OpSpec {
   int dil_w = 1;
   int group = 1;
 
-  float clip_min = 0.0f;
-  float clip_max = 1.0f;
+  // Clip bounds. ONNX Clip bounds are optional on both the attribute form
+  // (opset < 11) and the input form (opset >= 11); an omitted bound means the
+  // element type's extrema, NOT 0/1. Defaults are therefore +/-inf, which makes
+  // fminf/fmaxf a no-op for the bound that was not given.
+  float clip_min = -std::numeric_limits<float>::infinity();
+  float clip_max = std::numeric_limits<float>::infinity();
 
   int blocksize = 1;
   bool fuse_clip = false;  // DepthToSpace: fold a following Clip into the kernel
@@ -92,10 +97,10 @@ class HipEngine {
   bool GetOutputShape(const std::vector<int64_t>& input_shape,
                       std::vector<int64_t>& output_shape) const;
 
-  // Run inference. input/output hold NCHW [1,1,H,W] data in the layout
-  // the model expects (the engine handles the internal NHWC transpose).
-  // Element type follows the model IO: fp16 normally, raw fp32 when
-  // InputIsFp32()/OutputIsFp32() (fp32-input models / fp32-output models).
+  // Run inference. input/output hold NCHW [1,C,H,W] plane-major data - the
+  // engine transposes to/from its internal NHWC compute layout on-device for
+  // both IO dtypes. Element type follows the model IO: fp16 normally, raw fp32
+  // when InputIsFp32()/OutputIsFp32() (fp32-input models / fp32-output models).
   bool Run(const void* input_data, const std::vector<int64_t>& input_shape,
            void* output_data, std::string& error);
 
@@ -118,8 +123,10 @@ class HipEngine {
   // fp16; Run() converts on-device and returns raw fp32 host data).
   bool OutputIsFp32() const { return output_is_fp32_; }
 
-  // Model IO channels from the weight shapes (graph IO dims are dynamic):
-  // first-conv C (input) and tail-conv M (output). Valid after Build().
+  // Model IO channels. InputChannels() is the first Conv's C. OutputChannels()
+  // is the LAST Conv's M, i.e. the channel count *before* a trailing
+  // DepthToSpace - it is not the graph's output channel count. Use
+  // GetOutputShape() for anything that has to match the produced frame.
   int InputChannels() const;
   int OutputChannels() const;
 
@@ -157,6 +164,11 @@ class HipEngine {
   // host staging for the float download.
   void* output_staging_f32_ = nullptr;
   void* output_f32_dev_ = nullptr;
+  // fp16 IO with more than one channel: device scratch the NCHW<->NHWC
+  // transpose reads from / writes to (the public boundary is NCHW; the
+  // compute buffers are NHWC). C==1 needs neither.
+  void* io_f16_dev_ = nullptr;
+  size_t io_f16_dev_bytes_ = 0;
   size_t input_bytes_ = 0;
   size_t output_bytes_ = 0;
   bool input_is_fp32_ = false;
@@ -164,6 +176,11 @@ class HipEngine {
   bool output_is_fp32_ = false;
   size_t input_ort_bytes_ = 0;
   size_t output_ort_bytes_ = 0;
+
+  // VSHIP_PROFILE: events are created once per built plan, not per frame.
+  std::vector<void*> prof_events_;
+  uint64_t trace_run_no_ = 0;
+  uint64_t prof_frame_no_ = 0;
 
   std::mutex mutex_;
 };

@@ -157,6 +157,95 @@ def test_p1_09_depth_to_space_blocksize(engine, fixtures, device, blocksize):
 
 
 # ---------------------------------------------------------------------------
+# P2-10: multi-channel DepthToSpace (DCR channel order + output layout)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name,blocksize,cout", [
+    ("dts_multi_b2", 2, 2),
+    ("dts_multi_b2_f16", 2, 2),
+    ("dts_multi_b3", 3, 2),
+])
+def test_p2_10_multichannel_dts_uses_dcr_order(engine, fixtures, device, name, blocksize, cout):
+    """DCR maps input channel (r*B+q)*Cout + c, not CRD's c*B*B + r*B + q. The
+    two agree only for one output channel, so the multi-channel tail is what
+    catches a CRD kernel."""
+    fx = fixtures.get(name)
+    h = w = 16
+    result = engine.run(fx.model, h=h, w=w, c=1, device=device)
+    conv_out = ref.conv3x3(ref.logical_input(1, h, w, in_fp32=False), fx.weights, fx.bias)
+    expected = ref.depth_to_space_dcr(conv_out, blocksize)
+    assert result.shape == (1, cout, h * blocksize, w * blocksize), f"{name}: wrong output shape"
+    ref.assert_close(result.output, expected, ref.FP16_CONV_TOL, name)
+
+
+# ---------------------------------------------------------------------------
+# P2-13: fusion must not delete intermediates other consumers still need
+# ---------------------------------------------------------------------------
+
+
+def test_p2_13_silu_shared_input_still_runs(engine, fixtures, device):
+    """raw = conv(x); z = raw*sigmoid(raw); y = raw + z.
+
+    Fusing the SiLU pair renames the conv output to z, so ``raw`` would lose its
+    producer and the Add would fail (or bind the wrong tensor). The engine must
+    decline the fusion and compute the graph."""
+    fx = fixtures.get("silu_shared")
+    h = w = 16
+    result = engine.run(fx.model, h=h, w=w, c=4, device=device)
+    raw = ref.conv3x3(ref.logical_input(4, h, w, in_fp32=False), fx.weights, fx.bias)
+    expected = raw + raw / (1.0 + np.exp(-raw))
+    assert result.shape == (1, 4, h, w)
+    ref.assert_close(result.output, expected, ref.FP16_CONV_TOL, "silu with a shared raw")
+
+
+def test_p2_13_residual_conv_output_with_another_consumer(engine, fixtures, device):
+    """a = conv(x); bb = conv(a); s = a + bb; y = bb * s.
+
+    The residual Add's main input ``bb`` also feeds the Mul, so the Add must not
+    be fused into the second conv (the fusion replaces the conv's output name)."""
+    fx = fixtures.get("add_shared_conv_out")
+    h = w = 16
+    result = engine.run(fx.model, h=h, w=w, c=4, device=device)
+    x = ref.logical_input(4, h, w, in_fp32=False)
+    a = ref.conv3x3(x, fx.weights, fx.bias)
+    bb = ref.conv3x3(a, fx.weights, fx.bias)
+    expected = bb * (a + bb)
+    assert result.shape == (1, 4, h, w)
+    ref.assert_close(result.output, expected, ref.FP16_CONV_TOL, "residual with a shared conv output")
+
+
+# ---------------------------------------------------------------------------
+# P2-14: ONNX Conv padding and Clip bound semantics
+# ---------------------------------------------------------------------------
+
+
+def test_p2_14_asymmetric_pads_rejected(engine, fixtures, device):
+    """pads = [1,0,1,0] is not symmetric 1-padding: reading indices 0 and 2 as
+    (h, w) used to compute a different convolution with a different shape."""
+    _expect_rejected(engine, fixtures.get("conv_pads_asym"), c=4, match="pads", device=device)
+
+
+def test_p2_14_clip_without_bounds_does_not_clamp(engine, fixtures, device):
+    """An omitted Clip bound means the element type's extrema, not 0/1."""
+    fx = fixtures.get("clip_no_bounds")
+    h = w = 16
+    result = engine.run(fx.model, h=h, w=w, c=4, device=device)
+    expected = ref.conv3x3(ref.logical_input(4, h, w, in_fp32=False), fx.weights, fx.bias)
+    ref.assert_close(result.output, expected, ref.FP16_CONV_TOL, "clip without bounds")
+    # The fixture's bias pushes the conv output well above 1.0, so the old
+    # default of max=1 would have clamped it.
+    assert result.output.max() > 1.0, "unbounded Clip was clamped"
+
+
+def test_p2_14_dynamic_clip_bound_rejected(engine, fixtures, device):
+    """A bound computed at run time cannot be evaluated: reject, do not
+    substitute a default."""
+    _expect_rejected(engine, fixtures.get("clip_dynamic_bound"), c=4,
+                     match="dynamic Clip bounds", device=device)
+
+
+# ---------------------------------------------------------------------------
 # P1-6: device selection
 # ---------------------------------------------------------------------------
 

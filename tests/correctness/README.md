@@ -5,8 +5,9 @@ the **real** engine, the real gfx1100 kernels, the real ONNX Runtime provider
 and the real VapourSynth plugin — no CPU shim.
 
 Every test is named after the `REVIEW.md` finding it covers (`test_p1_03_...` =
-finding 3), so a failure points straight back at the review item that motivated
-the check.
+finding 3, `test_p2_11_...` = P2 finding 11), so a failure points straight back
+at the review item that motivated the check. The suite currently runs 82 checks
+(48 engine, 8 EP, 26 plugin) covering the P1 and P2 findings.
 
 ## Quick start
 
@@ -35,9 +36,9 @@ failed), `pytest`, `onnxruntime` (EP suite and the chroma CPU reference), and
 
 | Suite | File | Covers |
 |---|---|---|
-| `engine` | `test_engine.py` | The standalone `HipEngine`: kernel geometry, weight/bias validation, typed initializers, binary ops, DTS block size, device selection, allocation failures. 40 checks. |
-| `ep` | `test_ep.py` | The ONNX Runtime provider: fp32 boundary conversion, device fallback, shape rebuilds. |
-| `plugin` | `test_plugin.py` | The VapourSynth plugin: which clip formats/plane counts are accepted and rejected, plus the shipped multi-plane models and their chroma planes. 18 checks. |
+| `engine` | `test_engine.py` | The standalone `HipEngine`: kernel geometry, weight/bias validation, typed initializers, binary ops, DTS block size and channel order, device selection, allocation failures, fusion with shared intermediates, Conv pads / Clip bounds. 48 checks. |
+| `ep` | `test_ep.py` | The ONNX Runtime provider: fp32 boundary conversion, device fallback, shape rebuilds, multi-channel layout conversion, partition boundaries. 8 checks. |
+| `plugin` | `test_plugin.py` | The VapourSynth plugin: which clip formats/plane counts are accepted and rejected, the shipped multi-plane models and their chroma planes, fp16 multi-channel layout, integer-clip packing, option defaults and tiling arguments, flexible-output plane count. 26 checks. |
 
 Performance is deliberately out of scope — see `tests/multires.py`,
 `tests/benchmark.py` and `tests/vs_test.py` for speed/accuracy runs.
@@ -135,12 +136,22 @@ builders in `harness/modelgen.py` only ever run as `python -m harness.modelgen`,
 and the test process reads `harness/fixtures.py` (no `onnx` import). Keep that
 split.
 
-**Scope of the EP suite.** The EP's supported layout is a single activation
-input/output, and its multi-channel buffer conversion is still open
-(`REVIEW.md` P2-11). The P1-4/P1-6 checks therefore use one input and one output
-channel, and the multi-channel gap is recorded as a **strict xfail**
-(`test_p2_11_multichannel_layout_is_converted`): when P2-11 is fixed that test
-XPASSes and fails the run until the marker is removed — the intended prompt.
+**Scope of the EP suite.** The EP claims only regions with a single activation
+input and a single output (the compiled graph reads input 0 and writes output
+0); anything else must fall back to another provider. `get_providers()` cannot
+distinguish "claimed nothing" from "claimed everything" (it still lists the EP
+on a graph it refused), so capability is observed by disabling the CPU fallback:
+an unclaimed node then fails session creation. `_hip_only_session` in
+`test_ep.py` wraps that, and the P2-17 checks use it. Multi-channel EP buffers
+now get the same NCHW<->NHWC conversion as the standalone engine (P2-11).
+
+**If a numeric check fails by a small scattered amount — re-run it first.**
+There is a pre-existing intermittent corruption in the engine (roughly 1 run in
+30 on the chroma model: 3-5% of pixels off by 0.02-0.11, different garbage per
+process). It predates the P2 fixes and is documented in `src/hip/HIP_NOTES.md`
+("intermittent output corruption"); the reproducer is
+`tmp/p2probe/find.py`. A failure far larger than that (or in a whole plane) is a
+real regression.
 
 `tests/README.md`-style reference data and the shipped ArtCNN models live in
 `tests/`; this suite reuses them for the plugin checks.

@@ -150,6 +150,10 @@ class HipGraph {
   int output_buffer_ = -1;
   void* input_staging_ = nullptr;
   void* output_staging_ = nullptr;
+  // Device scratch for the NCHW<->NHWC IO transpose (the ORT tensors are NCHW,
+  // the compute buffers NHWC) when either side has more than one channel.
+  void* io_scratch_ = nullptr;
+  size_t io_scratch_bytes_ = 0;
   size_t input_bytes_ = 0;
   size_t output_bytes_ = 0;
   // Boundary Cast nodes (fp32<->fp16) are folded into the IO conversion.

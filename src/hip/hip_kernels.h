@@ -480,8 +480,11 @@ __global__ __launch_bounds__(256) void binary_kernel(
   out[i] = (_Float16)y;
 }
 
-// DepthToSpace DCR in NHWC: out[oh][ow][c] = in[h][w][c*B*B + r*B + q]
-// with r = oh % B, q = ow % B, h = oh / B, w = ow / B. C = output channels.
+// DepthToSpace DCR in NHWC. ONNX DCR reshapes the input to [N, B, B, C/B^2, H, W],
+// i.e. the input channel for output (c, r, q) is (r*B + q)*Cout + c -- NOT the
+// CRD order c*B*B + r*B + q (that is the "CRD" mode, which this engine rejects).
+// The two coincide only for Cout == 1, which is why the luma-only path hid it.
+// C = output channels; input channels = C*B*B.
 struct DtsParams {
   uint32_t c, h, w, b;
   uint32_t do_clip;
@@ -502,17 +505,18 @@ __global__ __launch_bounds__(256) void dts_kernel(
   uint q = ow % p.b;
   uint h = oh / p.b;
   uint w = ow / p.b;
-  uint cin = c * p.b * p.b + r * p.b + q;
+  uint cin = (r * p.b + q) * p.c + c;  // DCR
   uint in_idx = (h * p.w + w) * (p.c * p.b * p.b) + cin;
   _Float16 v = in[in_idx];
   if (p.do_clip) v = (_Float16)fminf(fmaxf((float)v, p.min_val), p.max_val);
   out[idx] = v;
 }
 
-// 2D-grid DTS for the standalone plugin engine (the EP keeps dts_kernel above).
-// ow/oh come straight from block/thread indices: zero div/mod in the common
-// path (only h=oh/B, w=ow/B remain). C is looped (C==1 on the ArtCNN tail).
-// Caller must check p.b >= 1 and p.c * p.b * p.b <= input channel count.
+// 2D-grid DTS for the standalone plugin engine. ow/oh come straight from
+// block/thread indices: zero div/mod in the common path (only h=oh/B, w=ow/B
+// remain). C is looped (C==1 on the ArtCNN tail). DCR channel order (see
+// dts_kernel). Caller must check p.b >= 1 and p.c * p.b * p.b <= input channel
+// count.
 __global__ __launch_bounds__(256) void dts_kernel_2d(
     const _Float16* __restrict__ in, _Float16* __restrict__ out, DtsParams p)
 {
@@ -528,8 +532,9 @@ __global__ __launch_bounds__(256) void dts_kernel_2d(
   const uint cstride = p.c * p.b * p.b;
   const uint in_row = (h * p.w + w) * cstride;
   const uint out_row = (oh * Wout + ow) * p.c;
+  const uint dts_off = (r * p.b + q) * p.c;  // DCR: input channel block for this (r,q)
   for (uint c = 0u; c < p.c; ++c) {
-    const uint in_idx = in_row + c * p.b * p.b + r * p.b + q;
+    const uint in_idx = in_row + dts_off + c;
     _Float16 v = in[in_idx];
     if (p.do_clip) v = (_Float16)fminf(fmaxf((float)v, p.min_val), p.max_val);
     out[out_row + c] = v;
@@ -537,12 +542,18 @@ __global__ __launch_bounds__(256) void dts_kernel_2d(
 }
 
 // Input-centric final fp32 DTS: one thread per INPUT pixel loads its whole
-// B*B*C block as contiguous half4s (coalesced) and scatters float outputs -
+// B*B block as one contiguous half4 (coalesced) and scatters float outputs -
 // loads stall warps, scattered stores don't. Also fuses the fp16->fp32 output
 // cast (clip in fp32), so the tail needs no extra pass over 8M px.
-// REQUIRES p.b == 2: the whole-block half4 load and the B*B=4 layout are
-// hard-coded, and p.b == 1/3 over-reads or mis-indexes. Callers must fall back
-// to dts_kernel_2d otherwise.
+//
+// REQUIRES p.b == 2 AND p.c == 1: the whole-block half4 load is only the DCR
+// channel block when B*B == 4 elements are contiguous, which happens exactly
+// when Cout == 1 (DCR then reduces to cin == k). Other block sizes / channel
+// counts over-read or mis-index and must use dts_kernel_2d (plus the trailing
+// output transpose). The output is NCHW, matching the engine's fp32 boundary,
+// so the caller sets its "DTS already wrote the final buffer" flag. For Cout==1
+// the NHWC and NCHW layouts are identical, so the shipped luma tail is
+// unaffected.
 __global__ __launch_bounds__(256) void dts_kernel_in_f32(
     const _Float16* __restrict__ in, float* __restrict__ out, DtsParams p)
 {
@@ -550,6 +561,7 @@ __global__ __launch_bounds__(256) void dts_kernel_in_f32(
   const uint h = blockIdx.y * 8u + threadIdx.y;
   if (w >= p.w || h >= p.h) return;
   const uint Wout = p.w * p.b;
+  const uint Hout = p.h * p.b;
   const uint bb = p.b * p.b;
   const uint in_base = (h * p.w + w) * (p.c * bb);
   for (uint c = 0u; c < p.c; ++c) {
@@ -560,7 +572,61 @@ __global__ __launch_bounds__(256) void dts_kernel_in_f32(
       const uint q = k - r * p.b;
       float v = (float)lv[k];
       if (p.do_clip) v = fminf(fmaxf(v, p.min_val), p.max_val);
-      out[((h * p.b + r) * Wout + (w * p.b + q)) * p.c + c] = v;
+      out[c * Hout * Wout + (h * p.b + r) * Wout + (w * p.b + q)] = v;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-channel IO layout / dtype conversion.
+//
+// The kernels compute in NHWC; the public boundary of both the standalone
+// engine and the ORT EP is NCHW (the layout ORT and VapourSynth planes use).
+// All three kernels are pure permutations over the same element count, so one
+// thread per element covers the whole tensor. Callers skip the launch when
+// C == 1, where NCHW and NHWC are the same layout.
+// ---------------------------------------------------------------------------
+
+// fp16 -> fp16. to_nhwc != 0: NCHW -> NHWC; to_nhwc == 0: NHWC -> NCHW.
+__global__ __launch_bounds__(256) void transpose_f16(
+    const _Float16* __restrict__ in, _Float16* __restrict__ out,
+    uint32_t N, uint32_t C, uint32_t H, uint32_t W, uint32_t to_nhwc)
+{
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t hw = H * W;
+  if (i >= N * C * hw) return;
+  const uint32_t n = i / (C * hw);
+  const uint32_t r = i - n * C * hw;
+  const uint32_t c = r / hw;
+  const uint32_t p = r - c * hw;
+  if (to_nhwc) out[(n * hw + p) * C + c] = in[i];
+  else out[i] = in[(n * hw + p) * C + c];
+}
+
+// fp32 NCHW -> fp16 NHWC (fp32-input models).
+__global__ __launch_bounds__(256) void cast_f32_to_f16_transpose(
+    const float* __restrict__ in, _Float16* __restrict__ out,
+    uint32_t N, uint32_t C, uint32_t H, uint32_t W)
+{
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N * H * W) return;
+  const uint32_t n = i / (H * W);
+  const uint32_t hw = i - n * H * W;
+  for (uint32_t c = 0; c < C; ++c) {
+    out[(n * H * W + hw) * C + c] = (_Float16)in[(n * C + c) * H * W + hw];
+  }
+}
+
+// fp16 NHWC -> fp32 NCHW (fp32-output models).
+__global__ __launch_bounds__(256) void cast_f16_to_f32_transpose(
+    const _Float16* __restrict__ in, float* __restrict__ out,
+    uint32_t N, uint32_t C, uint32_t H, uint32_t W)
+{
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N * H * W) return;
+  const uint32_t n = i / (H * W);
+  const uint32_t hw = i - n * H * W;
+  for (uint32_t c = 0; c < C; ++c) {
+    out[(n * C + c) * H * W + hw] = (float)in[(n * H * W + hw) * C + c];
   }
 }
