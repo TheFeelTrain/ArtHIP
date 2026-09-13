@@ -26,11 +26,10 @@ SHIPPED_MODELS = {
 }
 
 # Production artifacts and their build scripts.
-ENGINE_SOURCES = REPO_ROOT / "src/vapoursynth/hip"
+PLUGIN_SOURCES = REPO_ROOT / "src/vapoursynth"
 HIP_SOURCES = REPO_ROOT / "src/hip"
-COMMON_SOURCES = REPO_ROOT / "src/vapoursynth/common"
-PLUGIN_SO = ENGINE_SOURCES / "build/libhip.so"
-PLUGIN_BUILD_SCRIPT = REPO_ROOT / "src/vapoursynth/build_hip.sh"
+PLUGIN_SO = PLUGIN_SOURCES / "build/libhip.so"
+PLUGIN_BUILD_SCRIPT = PLUGIN_SOURCES / "build_hip.sh"
 EP_SO = HIP_SOURCES / "build/libonnxruntime_providers_hip.so"
 EP_BUILD_SCRIPT = HIP_SOURCES / "build.sh"
 ENGINE_HARNESS_SO = BUILD_DIR / "libengine_harness.so"

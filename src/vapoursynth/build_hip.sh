@@ -9,7 +9,7 @@
 # Usage: ./build_hip.sh [output_dir]
 set -euo pipefail
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/hip" && pwd)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${1:-${SRC_DIR}/build}"
 mkdir -p "${OUT_DIR}"
 
@@ -26,14 +26,13 @@ echo "[build] ONNX headers: ${ONNX_INC}"
 
 "${HIPCC}" --offload-arch=gfx1100 ${CXXFLAGS} \
   -I"${SRC_DIR}" \
-  -I"${SRC_DIR}/.." \
-  -I"${SRC_DIR}/../../hip" \
+  -I"${SRC_DIR}/../hip" \
   -I"${VS_INC}" \
   -I"${ONNX_INC}" \
   "${SRC_DIR}/vs_hip.cpp" \
   "${SRC_DIR}/hip_engine.cc" \
-  "${SRC_DIR}/../common/onnx_utils.cpp" \
-  "${SRC_DIR}/../common/convert_float_to_float16.cpp" \
+  "${SRC_DIR}/onnx_utils.cpp" \
+  "${SRC_DIR}/convert_float_to_float16.cpp" \
   -o "${OUT_DIR}/libhip.so" \
   ${LIBS}
 

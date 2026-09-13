@@ -2,7 +2,7 @@
 //
 // The Python side owns input generation and all reference math; this driver
 // only maps the C++ engine API onto a small C ABI so tests can exercise the
-// real production source (src/vapoursynth/hip/hip_engine.cc) plus the real
+// real production source (src/vapoursynth/hip_engine.cc) plus the real
 // gfx1100 kernels.
 //
 // It is built as a shared library, mirroring src/vapoursynth/build_hip.sh:

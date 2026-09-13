@@ -46,9 +46,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "../common/convert_float_to_float16.h"
-#include "../common/onnx_utils.h"
+#include "convert_float_to_float16.h"
 #include "hip_engine.h"
+#include "onnx_utils.h"
 
 struct HipData {
   std::vector<vship::HipEngine*> engines;

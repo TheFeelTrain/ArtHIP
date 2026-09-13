@@ -24,7 +24,7 @@ VapourSynth filter chain, so raw speed wins.
   `python tests/correctness/run.py` — see `tests/correctness/README.md`. Run it
   before and after any kernel/engine change; add a test when fixing a bug.
 - Plugin: `cd src/vapoursynth && ./build_hip.sh` (`hipcc
-  --offload-arch=gfx1100`), then `cp hip/build/libhip.so
+  --offload-arch=gfx1100`), then `cp build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/` (world-writable,
   no root needed).
 - Provider (ORT EP): `cd src/hip && ./build.sh`.

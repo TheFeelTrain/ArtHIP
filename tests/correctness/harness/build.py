@@ -96,13 +96,13 @@ def build_engine_harness(*, force: bool = False, no_build: bool = False) -> Path
     harness_cc = Path(__file__).resolve().parent / "engine_harness.cc"
     deps = [
         harness_cc,
-        paths.ENGINE_SOURCES / "hip_engine.cc",
-        paths.ENGINE_SOURCES / "hip_engine.h",
+        paths.PLUGIN_SOURCES / "hip_engine.cc",
+        paths.PLUGIN_SOURCES / "hip_engine.h",
         paths.HIP_SOURCES / "hip_kernels.h",
-        paths.COMMON_SOURCES / "onnx_utils.cpp",
-        paths.COMMON_SOURCES / "onnx_utils.h",
-        paths.COMMON_SOURCES / "convert_float_to_float16.cpp",
-        paths.COMMON_SOURCES / "convert_float_to_float16.h",
+        paths.PLUGIN_SOURCES / "onnx_utils.cpp",
+        paths.PLUGIN_SOURCES / "onnx_utils.h",
+        paths.PLUGIN_SOURCES / "convert_float_to_float16.cpp",
+        paths.PLUGIN_SOURCES / "convert_float_to_float16.h",
     ]
 
     def build() -> None:
@@ -112,13 +112,13 @@ def build_engine_harness(*, force: bool = False, no_build: bool = False) -> Path
             [
                 "hipcc", "--offload-arch=gfx1100", "-std=c++17", "-O2", "-g",
                 "-fPIC", "-shared", "-w", "-DONNX_ML", "-DONNX_NAMESPACE=onnx",
-                f"-I{paths.ENGINE_SOURCES}",
+                f"-I{paths.PLUGIN_SOURCES}",
                 f"-I{paths.HIP_SOURCES}",
                 "-I/usr/include",
                 str(harness_cc),
-                str(paths.ENGINE_SOURCES / "hip_engine.cc"),
-                str(paths.COMMON_SOURCES / "onnx_utils.cpp"),
-                str(paths.COMMON_SOURCES / "convert_float_to_float16.cpp"),
+                str(paths.PLUGIN_SOURCES / "hip_engine.cc"),
+                str(paths.PLUGIN_SOURCES / "onnx_utils.cpp"),
+                str(paths.PLUGIN_SOURCES / "convert_float_to_float16.cpp"),
                 "-o", str(paths.ENGINE_HARNESS_SO),
                 "-lonnx", "-lonnx_proto", "-lprotobuf", "-lpthread", "-ldl",
             ],
@@ -156,8 +156,7 @@ def build_ep(*, force: bool = False, no_build: bool = False) -> Path:
 def build_plugin(*, force: bool = False, no_build: bool = False) -> Path:
     """Build libhip.so via the plugin's own script."""
     deps = (
-        _glob("src/vapoursynth/hip/*.cpp", "src/vapoursynth/hip/*.h")
-        + _glob("src/vapoursynth/common/*.cpp", "src/vapoursynth/common/*.h")
+        _glob("src/vapoursynth/*.cc", "src/vapoursynth/*.cpp", "src/vapoursynth/*.h")
         + [paths.HIP_SOURCES / "hip_kernels.h"]
     )
 

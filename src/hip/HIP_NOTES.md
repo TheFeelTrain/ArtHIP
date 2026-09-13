@@ -504,13 +504,13 @@ FAILED / REVERTED (do not blind-retry):
 
 # HIP NOTES - standalone HIP plugin + HIP execution provider
 
-Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
+Working notes for `src/vapoursynth/` (VapourSynth plugin) and `src/hip/`
 (EP / winograd WMMA kernels). Vulkan-side history lives in
 `../vulkan/OPTIMIZATION_NOTES.md`.
 
 ## Layout & Build
 
-- Plugin: `src/vapoursynth/hip/{vs_hip.cpp, hip_engine.cc, hip_engine.h}`
+- Plugin: `src/vapoursynth/{vs_hip.cpp, hip_engine.cc, hip_engine.h}`
   built by `src/vapoursynth/build_hip.sh`
   (`hipcc --offload-arch=gfx1100`, links system onnx + protobuf; no ORT).
   VapourSynth API4 (`VapourSynth4.h`, `VapourSynthPluginInit2`,
@@ -524,7 +524,7 @@ Working notes for `src/vapoursynth/hip/` (VapourSynth plugin) and `src/hip/`
   1.29.0, like vulkanonnx `build_provider_system.sh`; links
   libonnxruntime_providers_shared). `tests/multires.py` fail-fasts if the
   .so is missing / registration fails / the session falls back from HIP.
-- Install: `cp src/vapoursynth/hip/build/libhip.so
+- Install: `cp src/vapoursynth/build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
 - vsscale: `Backend.HIP` registered in
   `/usr/lib/python3.14/site-packages/vsscale/mlrt/backend/base.py`

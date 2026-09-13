@@ -9,9 +9,9 @@ kernels. Currently beats the MIGraphX reference plugin (~23.0 vs ~15.7 fps @1080
 - `src/hip/` — kernels (`hip_kernels.h`, shared by both paths below),
   the ONNX Runtime execution provider (`hip_graph.cc`, ...), micro-benches,
   and `HIP_NOTES.md` (experiment log — read this before touching kernels).
-- `src/vapoursynth/` — the standalone VapourSynth plugin (`hip/`: `vs_hip.cpp`
-  + `hip_engine.cc/h`, no ORT involved), shared ONNX helpers (`common/`),
-  and `build_hip.sh`.
+- `src/vapoursynth/` — the standalone VapourSynth plugin (`vs_hip.cpp`
+  + `hip_engine.cc/h`, no ORT involved), shared ONNX helpers
+  (`onnx_utils`, `convert_float_to_float16`), and `build_hip.sh`.
 - `tests/` — `benchmark.py` + `multires.py` (HIP EP vs MIGraphX EP via ORT),
   `vs_test.py` (`VS_BACKEND=hip|migx` VapourSynth comparison), test images,
   `.mxr_cache/` (MIGraphX compiled programs — 7.6GB, saves recompiles).
@@ -20,7 +20,7 @@ kernels. Currently beats the MIGraphX reference plugin (~23.0 vs ~15.7 fps @1080
 
 - Plugin: `cd src/vapoursynth && ./build_hip.sh` (`hipcc
   --offload-arch=gfx1100`), then copy the result into your VapourSynth
-  plugins dir, e.g. `cp hip/build/libhip.so
+  plugins dir, e.g. `cp build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
 - Provider (ORT EP): `cd src/hip && ./build.sh`
 - VapourSynth comparison: `VS_BACKEND=<hip|migx> vspipe -p
