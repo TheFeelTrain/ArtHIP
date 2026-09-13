@@ -157,16 +157,11 @@ Tools for the next attempt (all env-gated, off by default):
 - `tests/tools/multires.py` rewritten: each backend runs in its OWN process (the
   HIP+MIGX same-process teardown crash), the CPU reference cache is keyed by
   SHA-256 of the model file and the input tensor, accuracy is ASSERTED against
-  the reference (fail on non-finite, maxdiff > 0.01, or >0.5 % 8-bit
+  the reference (fail on non-finite, maxdiff > 0.01, or >2.5 % 8-bit
   mismatches), and a session that cannot claim the graph fails instead of
   falling back (`session.disable_cpu_ep_fallback`). `--no-speed` is the fast
   accuracy gate; rounds alternate HIP/MIGX.
 - `tests/tools/corruption_hunt.py` (new): the intermittent-corruption hunter above.
-- `tests/tools/benchmark.py`: was silently SKIPPING the HIP EP (a plugin EP is absent
-  from `get_available_providers()`) and swallowed per-provider exceptions. It now
-  builds each session with the CPU fallback disabled (placement is proven, not
-  inferred from a provider name), reports failures, and exits non-zero.
-  HIP 2.28 ms/iter vs MIGX 2.73 at 256px on the 7900 XTX.
 
 ## P1 review fixes (2026-09-10, SHIPPED) — review items 1-9
 

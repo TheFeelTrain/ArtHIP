@@ -16,7 +16,5 @@ __pycache__/
 # Local DSH state
 .dsh-managed-access.json
 
-# Test caches and generated outputs (regenerated; never committed)
-tests/.mxr_cache/
+# Test caches (regenerated; never committed)
 tests/.cache/
-tests/out/

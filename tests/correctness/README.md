@@ -40,8 +40,8 @@ failed), `pytest`, `onnxruntime` (EP suite and the chroma CPU reference), and
 | `ep` | `test_ep.py` | The ONNX Runtime provider: fp32 boundary conversion, device fallback, shape rebuilds, multi-channel layout conversion, partition boundaries. 8 checks. |
 | `plugin` | `test_plugin.py` | The VapourSynth plugin: which clip formats/plane counts are accepted and rejected, the shipped multi-plane models and their chroma planes, fp16 multi-channel layout, integer-clip packing, option defaults and tiling arguments, flexible-output plane count. 26 checks. |
 
-Performance is deliberately out of scope — see `tests/tools/multires.py`,
-`tests/tools/benchmark.py` and `tests/tools/vs_test.py` for speed/accuracy runs.
+Performance is deliberately out of scope — see `tests/tools/multires.py` and
+`tests/tools/vs_test.py` for speed/accuracy runs.
 
 ## Shipped models
 
