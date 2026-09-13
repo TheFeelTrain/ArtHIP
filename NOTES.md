@@ -1,3 +1,47 @@
+## FIXED 2026-09-13: intermittent corruption = missing LDS drain in winograd_conv
+
+The long-open rare/nondeterministic corruption is ROOT-CAUSED AND FIXED. It was
+a cross-wave shared-memory race in `winograd_conv`, not a host-path or
+uninitialized-memory bug:
+
+- `load_strip` writes the fp16 input strip into `strip4`; every wave's V
+  transform reads it. `S_BARRIER` synchronizes control flow but does NOT retire
+  outstanding LDS stores, so a wave could arrive at the top-of-loop barrier with
+  its `strip4` stores still in flight while another wave passed the barrier and
+  read stale shared memory. The AMDGPU memory model requires
+  `s_waitcnt lgkmcnt(0)` before such a barrier; LLVM's SIInsertWaitcnts pass
+  emitted it for 3 of the 4 `winograd_conv` barriers, but NOT on the loop-back
+  edge where the strip prefetch's stores arrive (verified in the gfx1100 ISA:
+  the entry path to the same barrier had one, the back edge did not).
+- The symptom matches every observation: op-level bisection showed one conv op
+  producing a wrong output from bit-identical inputs; the wrong pixels were
+  confined to ONE output row of one workgroup's tile band, ALL 64 channels,
+  and only the r=0 row -- i.e. exactly the tiles whose V transform reads one
+  wave's strip-cell range, and exactly the wpi=0 contribution those cells feed.
+  That is what a corrupt `strip4` read looks like, and why it was random across
+  ops/processes but stable within a frame.
+- FIX: `lds_barrier()` in `src/common/hip_kernels.h` =
+  `asm("s_waitcnt lgkmcnt(0)") ` + `__syncthreads()`, used at all four
+  `winograd_conv` barriers. Explicit, so the ordering no longer depends on the
+  waitcnt pass. Perf-neutral: paired 300f chroma 22.66/22.53/22.38/22.46 (pre)
+  vs 22.53/22.53/22.38/22.46 (post), 22.50 median both.
+- Evidence (interleaved A/B, one fresh process per sample, ORT-CPU reference,
+  same machine window):
+  - plugin chroma64 (tol 0.02): pre 16/165 bad, post 0/285.
+  - EP luma1920 (tol 0.003): pre 19/22 bad, post 0/22.
+  - engine harness, 16 fresh engines on luma 1080p: pre EVERY run deviated from
+    the run median by 1.7e-2..1.5e-1; post bit-identical (0.0).
+- GUARDS (both verified to fail on the pre-fix header):
+  - `tests/correctness/test_kernel.py` (new suite; hipcc only, no GPU): every
+    emitted `winograd_conv` barrier must be preceded by an LDS drain, and the
+    source must call `lds_barrier()`, never bare `__syncthreads()`.
+  - `tests/correctness/test_engine.py::test_winograd_fresh_engine_first_frames_agree`:
+    16 fresh engine builds on luma 1080p must give identical output.
+  Suite is now 85 checks (2 kernel / 49 engine / 8 EP / 26 plugin), all green.
+- `tests/tools/corruption_hunt.py` now covers the plugin route as well (it used
+  to send multi-channel cases to the stale `tmp/p2probe/find.py`) and grew
+  `--ab <soA> <soB>` for an interleaved grade of two builds/four routes.
+
 ## CURRENT BEST — 2026-09-10: transposed v_lds SHIPPED (+19-20%)
 
 vs-mlrt's libvsmigx.so was updated (2026-09-10) and MIGX now does 19.3-19.7 fps
@@ -35,11 +79,15 @@ Gate for everything here: `tests/correctness/run.py` 82/82 and the 1920px
 EP+luma accuracy vs ORT CPU at its 0.00134 baseline. RX 7900 XTX, MANGOHUD=0,
 paired/interleaved runs.
 
-### Rare output corruption — CHARACTERIZED, NOT FIXED (top open item)
+### Rare output corruption — ROOT-CAUSED AND FIXED 2026-09-13 (see the top section)
 
-The pre-existing intermittent corruption is REAL and reproduces in BOTH paths
-(standalone plugin and EP), so it lives in the shared kernels or their
-environment, not in one host path. What was measured this session:
+The pre-existing intermittent corruption was REAL and reproduced in BOTH paths
+(standalone plugin and EP), so it lived in the shared kernels. It was a
+missing LDS drain before the `winograd_conv` top-of-loop barrier — the section
+at the top of this file has the root cause, the fix, and the A/B evidence. The
+characterization below is kept because it is what pointed at the kernel, and
+because the rejected hypotheses are worth not re-testing. What was measured
+this session:
 
 - Rate is environmental, not binary-dependent: the same .so gives 0/40 and
   10/25 corrupt samples in different windows. Sizes matter: ~0 % at 64x64,
@@ -74,26 +122,30 @@ environment, not in one host path. What was measured this session:
     so a plain `hipMemcpy` dump on the null stream is NOT ordered after the
     kernels. The dump uses `hipMemcpyAsync(..., stream_)` + sync now; the first
     dump attempt produced bogus "non-determinism at op07" that this caused.
-- Leading remaining hypothesis: a memory-VISIBILITY race (a kernel reading a
-  value a copy or the previous kernel has written but not yet published), not a
-  logic bug — the "everything downstream is consistent with one bad input
-  value" signature and the NaN results both fit it. Untested because no window
-  was open when the sync-each knob existed.
+- (Former) leading hypothesis: a memory-VISIBILITY race. **CONFIRMED as an LDS
+  write-visibility race**: the strip stores reached the top-of-loop barrier
+  without a preceding `s_waitcnt lgkmcnt(0)`, so the compiler's waitcnt pass was
+  the thing that had to be right and was not. It was never a global-memory
+  visibility problem, which is why the LDS-specific angle (audit the barriers)
+  was the right one and the global poisoning results were negative.
 
 Tools for the next attempt (all env-gated, off by default):
-- `tests/tools/corruption_hunt.py [--cases luma1920] [--rounds N] [--tolerance T]`:
-  fresh process per sample, hash-keyed ORT-CPU reference, saves corrupt frames
-  to `tests/.cache/corrupt/`, exits non-zero on any hit. This is the way to notice a
-  window and to grade a fix.
+- `tests/tools/corruption_hunt.py [--cases ...] [--rounds N] [--tolerance T]` and
+  `--ab <soA> <soB>`: fresh process per sample, hash-keyed ORT-CPU reference,
+  saves corrupt frames to `tests/.cache/corrupt/`, exits non-zero on any hit.
+  Covers both routes: `--cases luma1920` (EP), `--cases chroma64` (plugin).
+  Use `--ab` to grade two builds interleaved — the rate drifts, so sequential
+  runs are not comparable.
 - `VSHIP_DUMP=<dir>` (engine): dumps every device op's inputs/output for the
   first two runs of a frame -> diff a corrupt run against a clean one op by op.
+  This is what localized the fault to one conv op with identical inputs.
 - `VSHIP_POISON=1` (engine + EP): NaN-fill all non-constant activation tensors
   each frame, turning read-before-write into NaN.
-- `VSHIP_SYNC_EACH=1` (EP): `hipStreamSynchronize` after every op — the direct
-  test of the cross-kernel visibility hypothesis.
-- `tmp/p2probe/find.py` (plugin chroma 64x64), `tmp/ab_corrupt.sh <soA> <soB> N`
-  (interleaved corruption-rate A/B), `tmp/find_corrupt_ep.py` (1920px EP
-  characterisation).
+- `VSHIP_SYNC_EACH=1` (EP): `hipStreamSynchronize` after every op.
+- `tmp/p2probe/find.py` (plugin chroma 64x64, now superseded by
+  `corruption_hunt.py --cases chroma64`), `tmp/find_corrupt_ep.py` (1920px EP
+  characterisation), `tmp/ab2.sh` / `tmp/ab_ep.sh` (the ad-hoc interleaved A/Bs
+  that graded the fix before `--ab` existed).
 
 ### Experiments run (results, all accuracy-gated)
 
@@ -310,22 +362,17 @@ HIP vs MIGX max absdiff **0.002441** (= the documented 0.0024, unchanged); 200
 blank 1080p frames hip **22.3 fps** vs migx 8.4; EP `multires.py 256`
 HIP-vs-CPU 0.00098 (= MIGX-vs-CPU) at 1.78 ms/iter vs MIGX 2.57; suite 82/82.
 
-**NOT from the review — intermittent chroma corruption (OPEN, pre-existing).**
-While validating #11 the chroma probe (3 planes -> 2, fp32 clip, 64x64) produced
-a corrupted frame: 3-5% of pixels off by 0.02-0.11, scattered over the whole
-plane, different garbage each process but bit-identical for repeated frames
-*within* one process. Rate is low and variable (~1/29 with the P2 build, ~1/37
-with a stashed pre-P2 build, 0/80 in another P2 run), so it is NOT a P2
-regression — the same binary produces good or bad output at random. That
-signature (per-process variation, in-process repeatability) points at reading
-state that was never written (LDS or device memory), not at a missing barrier in
-the winograd kernel (audited: strip and v_lds coverage is complete; the only
-unwritten bytes are the 4-half v_lds row padding and unwritten small-M tail
-channels, neither of which any store consumes). Reproducer:
-`tmp/p2probe/find.py` (loops until a bad chroma frame appears; ~30 runs).
-Next step: bisect by dumping an intermediate tensor (VSHIP_DEBUG device-op
-indices + a tensor readback) on a bad run, or run the same input repeatedly
-inside one process with `rocprofv2` LDS counters.
+**NOT from the review — intermittent chroma corruption (FIXED 2026-09-13; see
+the top section).** While validating #11 the chroma probe (3 planes -> 2, fp32
+clip, 64x64) produced a corrupted frame: 3-5% of pixels off by 0.02-0.11,
+scattered over the whole plane, different garbage each process but bit-identical
+for repeated frames *within* one process. Rate is low and variable (~1/29 with
+the P2 build, ~1/37 with a stashed pre-P2 build, 0/80 in another P2 run), so it
+is NOT a P2 regression — the same binary produced good or bad output at random.
+The "LDS coverage is complete" audit above was right and irrelevant: coverage
+was complete, but the *visibility* of those stores across waves at the barrier
+was not. Reproducer (now): `python tests/tools/corruption_hunt.py --cases
+chroma64` or `--ab <soA> <soB>`.
 
 Determinism measured the same session (direct plugin, `core.hip.Model`, one
 frame per process, SHA-256 of the plane):
@@ -479,13 +526,11 @@ FAILED / REVERTED (do not blind-retry):
 
 ## OPEN QUESTIONS
 
-- RARE nondeterminism / intermittent corruption — INVESTIGATED 2026-09-12, see
-  "Review follow-up (2026-09-12) -> Rare output corruption" at the top. It
-  reproduces in the EP as well as the plugin, is a first-run-per-process
-  transient at a random conv op, is NOT uninitialized LDS or uninitialized
-  global memory, and correlates with nothing controllable (heat, idle, CPU/GPU
-  load, engine count). Hunt with `tests/tools/corruption_hunt.py`; the leading
-  hypothesis is a memory-visibility race, testable with `VSHIP_SYNC_EACH=1`.
+- RARE nondeterminism / intermittent corruption — **FIXED 2026-09-13**: missing
+  `s_waitcnt lgkmcnt(0)` before the `winograd_conv` top-of-loop barrier (a
+  cross-wave `strip4` race), fixed by `lds_barrier()`. See the top section for
+  the root cause, the A/B evidence, and the two regression guards
+  (`test_kernel.py`, `test_winograd_fresh_engine_first_frames_agree`).
 - Actual resident waves/SIMD for winograd_conv (rocprofv2) — 3 predicted
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
 - Why did vs_ab_check segfault intermittently at teardown in 4-backend

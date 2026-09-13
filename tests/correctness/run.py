@@ -25,6 +25,7 @@ from pathlib import Path
 
 SUITE_DIR = Path(__file__).resolve().parent
 SUITES = {
+    "kernel": "test_kernel.py",
     "engine": "test_engine.py",
     "ep": "test_ep.py",
     "plugin": "test_plugin.py",

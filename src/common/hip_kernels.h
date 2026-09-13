@@ -39,6 +39,34 @@ __device__ __forceinline__ void wmma_mul(half16_t a, half16_t b, float8_t& d)
   d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, d);
 }
 
+// Workgroup barrier with an explicit LDS drain.
+//
+// S_BARRIER synchronizes control flow but does NOT retire outstanding LDS
+// operations: a wave that has issued a ds_store can reach the barrier before
+// that store is committed, and another wave can then pass the barrier and read
+// stale LDS.  Whenever LDS written by one wave is read by another, the writer
+// must execute `s_waitcnt lgkmcnt(0)` before the barrier (see the AMDGPU usage
+// notes and the ROCm "memory instruction scheduling" guidance).
+//
+// LLVM's SIInsertWaitcnts pass normally emits that waitcnt for `__syncthreads`,
+// but it missed the loop-back edge in `winograd_conv`: the strip4 prefetch's
+// stores reach the top-of-loop barrier with no preceding s_waitcnt, while the
+// entry path to the same barrier does have one.  That produced the rare,
+// tile- and lane-localized output corruption documented in NOTES.md (the V
+// transform of one wave reading a `strip4` cell another wave had written but
+// not yet committed).  Emitting the waitcnt ourselves makes the ordering
+// independent of the compiler's waitcnt analysis; an extra waitcnt is a no-op
+// when nothing is outstanding.
+__device__ __forceinline__ void lds_barrier()
+{
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+  // lgkmcnt only covers LDS/GDS/constant traffic, so this drains the shared
+  // memory writes without waiting on the in-flight global strip prefetch.
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#endif
+  __syncthreads();
+}
+
 // Fast SiLU: sigmoid via a degree-4 least-squares 2^f polynomial (max err
 // ~8e-6 on 2^f over [0,1) => ~1e-4 on SiLU). Costs ~4 FMA + floor + ldexp +
 // 1 rcp instead of libm expf + div (both 1/4-rate transcendentals). No
@@ -183,7 +211,7 @@ __global__ void winograd_conv(
     for (uint cb = 0u; cb < Cblocks; ++cb) {
     const uint cb_off = cb * 256u;
 
-    __syncthreads();  // strip (cb) visible
+    lds_barrier();  // strip (cb) visible to every wave
 
     // ---- V transform (strip -> v_lds), 64 idx split across 4 waves ----
     {
@@ -209,7 +237,7 @@ __global__ void winograd_conv(
           *reinterpret_cast<half4_t*>(v_lds + wp * 320u + nt_local * 20u + c4) = v4[wp];
       }
     }
-    __syncthreads();  // v_lds ready
+    lds_barrier();  // v_lds ready
 
     // ---- WMMA: 4 wp groups, A from U (this wave's k-block), B from v_lds ----
     // A: lane l holds U[ko=l%16][c=0..15] for (kblock=kgroup, wp, cb)
@@ -252,7 +280,7 @@ __global__ void winograd_conv(
     if (cb + 1u < Cblocks) load_strip(cb + 1u);
   }
 
-  __syncthreads();  // all waves done with v_lds
+  lds_barrier();  // all waves done with v_lds
 
   // ---- Output transform + writeback (LDS-staged, vec4) ----
   // Stage the 4 y matrices ColumnMajor into this wave's v_lds region:
@@ -273,7 +301,7 @@ __global__ void winograd_conv(
       v_lds[base + 3u * 256u + kol] = (_Float16)y11[e];
     }
   }
-  __syncthreads();
+  lds_barrier();  // staged output visible to the readback
 
   // 64 (nt, k4) combos per wave; each lane handles 2.
   const uint yb = wave * 1024u;

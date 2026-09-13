@@ -2,11 +2,12 @@
 
 Suites are plain pytest modules grouped by the component they exercise:
 
-======================  ==================================================
-``test_engine.py``      the standalone ``HipEngine`` (real GPU kernels)
-``test_ep.py``          the ONNX Runtime execution provider
-``test_plugin.py``      the VapourSynth plugin, through ``vspipe``
-======================  ==================================================
+========================  ==================================================
+``test_kernel.py``       kernel memory-ordering invariants (source + ISA)
+``test_engine.py``       the standalone ``HipEngine`` (real GPU kernels)
+``test_ep.py``           the ONNX Runtime execution provider
+``test_plugin.py``       the VapourSynth plugin, through ``vspipe``
+========================  ==================================================
 
 Run everything with ``python tests/correctness/run.py`` (one process per suite,
 which keeps the HIP and ONNX Runtime lifetimes apart) or an individual suite
@@ -21,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -70,6 +72,21 @@ def build_options(request) -> BuildOptions:
 def device(build_options: BuildOptions) -> int:
     """HIP device id the tests should use."""
     return build_options.device
+
+
+@pytest.fixture(scope="session")
+def kernel_asm(build_options: BuildOptions) -> Path:
+    """gfx1100 assembly for ``src/common/hip_kernels.h`` (needs hipcc, no GPU).
+
+    Used by the memory-ordering checks in ``test_kernel.py``; a machine without
+    the ROCm toolchain skips them rather than failing.
+    """
+    if shutil.which("hipcc") is None:
+        pytest.skip("hipcc is not on PATH (ROCm toolchain required)")
+    try:
+        return build.build_kernel_asm(force=build_options.force, no_build=build_options.no_build)
+    except build.BuildError as exc:
+        pytest.skip(str(exc))
 
 
 @pytest.fixture(scope="session")

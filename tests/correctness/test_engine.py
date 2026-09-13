@@ -279,3 +279,48 @@ def test_p1_05_allocation_failure_is_reported_then_recovers(engine, fixtures, de
     expected = ref.conv3x3(ref.logical_input(4, 16, 16, in_fp32=False), fx.weights, fx.bias)
     ref.assert_close(result.output, expected, ref.FP16_CONV_TOL,
                      "recovery run after an allocation failure")
+
+
+# ---------------------------------------------------------------------------
+# Cross-wave LDS visibility: the first frame of a fresh engine
+# ---------------------------------------------------------------------------
+
+#: ``engine_run`` builds a brand-new HipEngine and runs one frame per call, so
+#: every call is the "first frame of a process" that exposed the strip4 race
+#: (see test_kernel.py and NOTES.md).  Each run therefore gets a fresh roll of
+#: the dice, which is what makes an end-to-end check possible at all.
+FRESH_ENGINE_RUNS = 16
+
+#: A corrupt first frame was off by 1.7e-2 .. 0.15 on the pre-fix build; the
+#: only benign run-to-run spread in this path is fp16 subnormal rounding
+#: (~3e-5), so 1e-4 separates the two by more than two orders of magnitude.
+FRESH_ENGINE_TOL = 1e-4
+
+
+def test_winograd_fresh_engine_first_frames_agree(engine, shipped_models, device):
+    """The same input through fresh engines must give the same frame.
+
+    This is the runtime half of the LDS-visibility gate: a missing
+    ``s_waitcnt lgkmcnt(0)`` before a ``winograd_conv`` barrier let one wave
+    read a strip cell another wave had written but not committed, so a first
+    frame landed at a random convolution with a scattered error.  On the
+    pre-fix build essentially every fresh engine disagreed; after the fix the
+    runs are bit-identical.
+    """
+    model = shipped_models["luma"]
+    first = None
+    worst = 0.0
+    worst_run = -1
+    for run in range(FRESH_ENGINE_RUNS):
+        output = engine.run(model, h=1080, w=1920, c=1, device=device).output.astype(np.float32)
+        if first is None:
+            first = output
+            continue
+        deviation = float(np.abs(output - first).max())
+        if deviation > worst:
+            worst, worst_run = deviation, run
+    assert worst <= FRESH_ENGINE_TOL, (
+        f"fresh engine run {worst_run} differs from run 0 by {worst:.3e} "
+        f"(tolerance {FRESH_ENGINE_TOL:.0e}); the first frame of a fresh engine "
+        "is nondeterministic again -- see test_kernel.py for the LDS-ordering checks"
+    )

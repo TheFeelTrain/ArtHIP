@@ -6,8 +6,9 @@ and the real VapourSynth plugin — no CPU shim.
 
 Every test is named after the P1/P2 review finding it covers (`test_p1_03_...` =
 finding 3, `test_p2_11_...` = P2 finding 11), so a failure points straight back
-at the review item that motivated the check. The suite currently runs 82 checks
-(48 engine, 8 EP, 26 plugin) covering the P1 and P2 findings.
+at the review item that motivated the check. The suite currently runs 85 checks
+(2 kernel, 49 engine, 8 EP, 26 plugin) covering the P1 and P2 findings plus the
+intermittent-corruption fix.
 
 ## Quick start
 
@@ -30,13 +31,16 @@ python -m pytest -k blocksize
 
 Requirements: `hipcc`/`/dev/kfd` (a machine without them is skipped, not
 failed), `pytest`, `onnxruntime` (EP suite and the chroma CPU reference), and
-`vapoursynth` + `vspipe` (plugin suite).
+`vapoursynth` + `vspipe` (plugin suite). The kernel suite needs `hipcc` only —
+it compiles the shared kernels to gfx1100 assembly and inspects it, so it also
+runs on a machine with no GPU.
 
 ## Suites
 
 | Suite | File | Covers |
 |---|---|---|
-| `engine` | `test_engine.py` | The standalone `HipEngine`: kernel geometry, weight/bias validation, typed initializers, binary ops, DTS block size and channel order, device selection, allocation failures, fusion with shared intermediates, Conv pads / Clip bounds. 48 checks. |
+| `kernel` | `test_kernel.py` | Memory-ordering invariants of the shared WMMA kernels: the source must use the draining `lds_barrier()`, and every emitted `winograd_conv` barrier must be preceded by `s_waitcnt lgkmcnt(0)`. Deterministic, GPU-free regression guard for the intermittent corruption. 2 checks. |
+| `engine` | `test_engine.py` | The standalone `HipEngine`: kernel geometry, weight/bias validation, typed initializers, binary ops, DTS block size and channel order, device selection, allocation failures, fusion with shared intermediates, Conv pads / Clip bounds, and fresh-engine first-frame determinism. 49 checks. |
 | `ep` | `test_ep.py` | The ONNX Runtime provider: fp32 boundary conversion, device fallback, shape rebuilds, multi-channel layout conversion, partition boundaries. 8 checks. |
 | `plugin` | `test_plugin.py` | The VapourSynth plugin: which clip formats/plane counts are accepted and rejected, the shipped multi-plane models and their chroma planes, fp16 multi-channel layout, integer-clip packing, option defaults and tiling arguments, flexible-output plane count. 26 checks. |
 
@@ -146,12 +150,27 @@ an unclaimed node then fails session creation. `_hip_only_session` in
 now get the same NCHW<->NHWC conversion as the standalone engine (P2-11).
 
 **If a numeric check fails by a small scattered amount — re-run it first.**
-There is a pre-existing intermittent corruption in the engine (roughly 1 run in
-30 on the chroma model: 3-5% of pixels off by 0.02-0.11, different garbage per
-process). It predates the P2 fixes and is documented in `NOTES.md`
-("intermittent output corruption"); the reproducer is
-`tmp/p2probe/find.py`. A failure far larger than that (or in a whole plane) is a
-real regression.
+There *was* a pre-existing intermittent corruption in the engine (roughly 1 run
+in 30 on the chroma model: 3-5% of pixels off by 0.02-0.11, different garbage
+per process). It was fixed on 2026-09-13: `winograd_conv` reached its
+top-of-loop barrier with the `strip4` LDS stores still in flight, so another
+wave could read stale shared memory — `S_BARRIER` does not drain LDS, and the
+compiler only inserted the required `s_waitcnt lgkmcnt(0)` on the entry path,
+not on the loop-back edge where the strip prefetch's stores arrive. The fix is
+the explicit `lds_barrier()` helper in `src/common/hip_kernels.h`. Two guards
+keep it fixed:
+
+* `test_kernel.py::test_every_winograd_conv_barrier_is_preceded_by_an_lds_drain`
+  (and the source check next to it) — deterministic, checks the emitted code
+  even though the runtime symptom is a ~1-in-10 event;
+* `test_engine.py::test_winograd_fresh_engine_first_frames_agree` — builds a new
+  engine per frame and requires identical output, which is the exact window the
+  race lived in.
+
+A failure far larger than a scattered perturbation (or in a whole plane) is a
+real regression. The manual hunter
+`python tests/tools/corruption_hunt.py --ab <soA> <soB>` grades a suspect build
+against a known-good one on both the plugin and EP routes.
 
 `tests/README.md`-style reference data and the shipped ArtCNN models live in
 `tests/`; this suite reuses them for the plugin checks.
@@ -162,19 +181,20 @@ real regression.
 tests/correctness/
 ├── run.py                  # one command, process per suite
 ├── conftest.py             # options and session fixtures
+├── test_kernel.py          # kernel memory-ordering invariants (source + ISA)
 ├── test_engine.py          # HipEngine checks
 ├── test_ep.py              # execution-provider checks
 ├── test_plugin.py          # VapourSynth plugin checks
 ├── harness/
 │   ├── paths.py            # repo/build locations and shipped models
-│   ├── build.py            # build + install helpers
+│   ├── build.py            # build + install helpers, kernel ISA dump
 │   ├── reference.py        # NumPy references and comparison helpers
 │   ├── fixtures.py         # fixture loading (no onnx import)
 │   ├── modelgen.py         # ONNX fixture builders (subprocess only)
 │   ├── vsrun.py            # run VapourSynth probes, read JSON results
 │   ├── engine.py           # ctypes wrapper
 │   └── engine_harness.cc   # C++ driver over the real engine
-└── build/                  # generated: fixtures, harness .so, scripts
+└── build/                  # generated: fixtures, harness .so, kernel ISA, scripts
 ```
 
 `build/` is generated and ignored by git (via the repository-wide `build/`

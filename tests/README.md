@@ -21,7 +21,7 @@ Each tool resolves its own paths, so it can be run from anywhere.
 |---|---|
 | `tools/multires.py [res]` | HIP EP vs MIGraphX EP accuracy + speed per resolution |
 | `tools/vs_test.py` | VapourSynth script for `vspipe` (`VS_BACKEND=hip\|migx`) |
-| `tools/corruption_hunt.py` | hunts the known intermittent corruption |
+| `tools/corruption_hunt.py` | hunts the intermittent corruption through the EP **and** plugin routes; `--ab A.so B.so` grades a suspect build against a known-good one |
 
 ## Caches
 
