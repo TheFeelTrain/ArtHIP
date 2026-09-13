@@ -68,6 +68,7 @@ COMMON_DEFS="-DONNX_ML=1 -DONNX_NAMESPACE=onnx -DDISABLE_CONTRIB_OPS \
 INC_FLAGS=" \
   -I${BUILD_DIR} \
   -I${BUILD_DIR}/inc \
+  -I${SRC_DIR}/../common \
   -I${ORT_SRC}/include/onnxruntime \
   -I${ORT_SRC}/include/onnxruntime/core/session \
   -I${ORT_SRC}/onnxruntime \

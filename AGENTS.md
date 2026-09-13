@@ -15,7 +15,7 @@ VapourSynth filter chain, so raw speed wins.
   clip IO (GRAYS in → GRAYS out, like MIGX). True exec 2.30ms per 64→64
   conv (rocprofv3); the 26 convs ARE the frame (GPU 100% busy).
 - Authoritative state, kept optimizations, rejected experiments, and next
-  steps all live in `src/hip/HIP_NOTES.md` — read it before touching kernels,
+  steps all live in `NOTES.md` — read it before touching kernels,
   and do not duplicate it here.
 
 ## Build / Test
@@ -27,7 +27,7 @@ VapourSynth filter chain, so raw speed wins.
   --offload-arch=gfx1100`), then `cp build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/` (world-writable,
   no root needed).
-- Provider (ORT EP): `cd src/hip && ./build.sh`.
+- Provider (ORT EP): `cd src/onnxruntime-hip && ./build.sh`.
 - VapourSynth comparison: `MANGOHUD=0 VS_BACKEND=<hip|migx> vspipe -p
   "tests/vs_test.py" --` (500 blank 1920x1080 frames; vspipe R79 ignores
   script args, so the backend comes from VS_BACKEND, default hip).
@@ -45,7 +45,7 @@ VapourSynth filter chain, so raw speed wins.
   MIGraphX/MIOpen techniques, fast SiLU/exp approximations). The web has
   sourced real wins here (occupancy cliffs, VGPR-bank fix); verify findings
   against published results and keep searching even when not stuck.
-- KEEP `src/hip/HIP_NOTES.md` UPDATED AND CLEAN at all times. Record every
+- KEEP `NOTES.md` UPDATED AND CLEAN at all times. Record every
   experiment (change, result, correctness, status) there immediately after
   confirming it — mandatory before ending a session. Rules:
   - Failed/rejected experiments go in ONE place (the rejected ledger).

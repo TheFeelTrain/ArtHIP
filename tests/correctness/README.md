@@ -126,7 +126,7 @@ compares them against an independent ONNX Runtime CPU run).
 
 **One process per suite.** `run.py` invokes pytest separately per suite because
 the HIP runtime, the ONNX Runtime provider and VapourSynth do not always tear
-down cleanly when combined (see `src/hip/HIP_NOTES.md`).
+down cleanly when combined (see `NOTES.md`).
 
 **Fixtures are generated in a subprocess.** The `vsengine` pytest plugin imports
 VapourSynth in every pytest process, which auto-loads `libhip.so` and with it the
@@ -148,7 +148,7 @@ now get the same NCHW<->NHWC conversion as the standalone engine (P2-11).
 **If a numeric check fails by a small scattered amount — re-run it first.**
 There is a pre-existing intermittent corruption in the engine (roughly 1 run in
 30 on the chroma model: 3-5% of pixels off by 0.02-0.11, different garbage per
-process). It predates the P2 fixes and is documented in `src/hip/HIP_NOTES.md`
+process). It predates the P2 fixes and is documented in `NOTES.md`
 ("intermittent output corruption"); the reproducer is
 `tmp/p2probe/find.py`. A failure far larger than that (or in a whole plane) is a
 real regression.

@@ -504,9 +504,10 @@ FAILED / REVERTED (do not blind-retry):
 
 # HIP NOTES - standalone HIP plugin + HIP execution provider
 
-Working notes for `src/vapoursynth/` (VapourSynth plugin) and `src/hip/`
-(EP / winograd WMMA kernels). Vulkan-side history lives in
-`../vulkan/OPTIMIZATION_NOTES.md`.
+Working notes for `src/vapoursynth/` (VapourSynth plugin) and
+`src/onnxruntime-hip/` (EP); the winograd WMMA kernels they share live in
+`src/common/`. Vulkan-side history lives in
+`src/vulkan/OPTIMIZATION_NOTES.md`.
 
 ## Layout & Build
 
@@ -515,10 +516,10 @@ Working notes for `src/vapoursynth/` (VapourSynth plugin) and `src/hip/`
   (`hipcc --offload-arch=gfx1100`, links system onnx + protobuf; no ORT).
   VapourSynth API4 (`VapourSynth4.h`, `VapourSynthPluginInit2`,
   `-DVS_USE_LATEST_API` = API 4.2).
-- Kernels: `src/hip/hip_kernels.h` - native wave32 WMMA via
-  `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`; shared with `src/hip/`
+- Kernels: `src/common/hip_kernels.h` - native wave32 WMMA via
+  `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`; shared by the plugin and the
   execution-provider code.
-- Provider (ORT EP): `src/hip/build.sh` (ORT v1.29.0 sources in git-ignored
+- Provider (ORT EP): `src/onnxruntime-hip/build.sh` (ORT v1.29.0 sources in git-ignored
   `tmp/ort129`; vtable defines `-DENABLE_TRAINING -DORT_USE_NCCL
   -DENABLE_STRIDED_TENSORS` + `-mf16c -mavx2` to match Arch onnxruntime-rocm
   1.29.0, like vulkanonnx `build_provider_system.sh`; links
@@ -848,7 +849,7 @@ routed every non-migx backend to VULKAN until fixed. Always verify
 - `VSHIP_TRACE=1` per-frame engine enter/leave lines (overlap analysis).
 - `VSHIP_DEBUG=1` fp32-path diagnostics (memcpy/launch rc, input dump).
 
-### Kernel tuning log (winograd_conv in src/hip/hip_kernels.h)
+### Kernel tuning log (winograd_conv in src/common/hip_kernels.h)
 Roofline @1080p per 64->64 conv: ~68 GFLOP winograd => 4.4 ms measured =
 ~15 TFLOPS (gfx11 fp16 WMMA peak ~113 T) => 13% of peak; DRAM floor
 ~0.56 ms (506 MB in+out) => 8x above bandwidth floor. LATENCY-bound, not

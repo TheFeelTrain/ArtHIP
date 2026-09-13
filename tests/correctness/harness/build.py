@@ -98,7 +98,7 @@ def build_engine_harness(*, force: bool = False, no_build: bool = False) -> Path
         harness_cc,
         paths.PLUGIN_SOURCES / "hip_engine.cc",
         paths.PLUGIN_SOURCES / "hip_engine.h",
-        paths.HIP_SOURCES / "hip_kernels.h",
+        paths.COMMON_SOURCES / "hip_kernels.h",
         paths.PLUGIN_SOURCES / "onnx_utils.cpp",
         paths.PLUGIN_SOURCES / "onnx_utils.h",
         paths.PLUGIN_SOURCES / "convert_float_to_float16.cpp",
@@ -113,7 +113,7 @@ def build_engine_harness(*, force: bool = False, no_build: bool = False) -> Path
                 "hipcc", "--offload-arch=gfx1100", "-std=c++17", "-O2", "-g",
                 "-fPIC", "-shared", "-w", "-DONNX_ML", "-DONNX_NAMESPACE=onnx",
                 f"-I{paths.PLUGIN_SOURCES}",
-                f"-I{paths.HIP_SOURCES}",
+                f"-I{paths.COMMON_SOURCES}",
                 "-I/usr/include",
                 str(harness_cc),
                 str(paths.PLUGIN_SOURCES / "hip_engine.cc"),
@@ -137,7 +137,9 @@ def build_engine_harness(*, force: bool = False, no_build: bool = False) -> Path
 
 def build_ep(*, force: bool = False, no_build: bool = False) -> Path:
     """Build libonnxruntime_providers_hip.so via the provider's own script."""
-    deps = _glob("src/hip/*.cc", "src/hip/*.h")
+    deps = _glob("src/onnxruntime-hip/*.cc", "src/onnxruntime-hip/*.h") + [
+        paths.COMMON_SOURCES / "hip_kernels.h"
+    ]
 
     def build() -> None:
         print(f"[correctness] building HIP execution provider -> {paths.EP_SO.name}")
@@ -157,7 +159,7 @@ def build_plugin(*, force: bool = False, no_build: bool = False) -> Path:
     """Build libhip.so via the plugin's own script."""
     deps = (
         _glob("src/vapoursynth/*.cc", "src/vapoursynth/*.cpp", "src/vapoursynth/*.h")
-        + [paths.HIP_SOURCES / "hip_kernels.h"]
+        + [paths.COMMON_SOURCES / "hip_kernels.h"]
     )
 
     def build() -> None:

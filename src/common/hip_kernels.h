@@ -24,7 +24,7 @@ struct ConvParams {
 // proven Vulkan EP kernel (winograd_wmma.comp, 1.02% @256). WG = 128 threads
 // = 4 wave32s; each wave owns ONE k-block (16 ko) -> the whole M=64 sits in
 // one WG (strip loaded once, used by all 4 k-blocks; no L2 strip sharing
-// needed). Verified w32 fragments (wmma_bench, exact):
+// needed). Verified w32 fragments (exact):
 //   A/B: lane l holds row l%16, all 16 k        (a[e] = A[l%16][e])
 //   D:   lane l, element e: D[row = 2e + (l/16)][col = l%16]  (8 fp32)
 // Vectorized like the Vulkan EP: strip loaded as half4 (b64), V transform on

@@ -1,7 +1,7 @@
 // Standalone HIP inference engine for the ArtCNN-style fp16 conv chain.
 // Parses an ONNX model directly (ModelProto) and runs the fused graph on the
 // GPU with the same winograd WMMA kernels as the HIP execution provider
-// (src/hip/hip_kernels.h) - no ONNX Runtime involved.
+// (src/common/hip_kernels.h) - no ONNX Runtime involved.
 #pragma once
 
 #include <cstdint>

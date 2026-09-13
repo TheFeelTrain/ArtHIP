@@ -43,7 +43,7 @@ _pybind_state.set_default_logger_severity(3)
 
 _hip_provider_so = _os.environ.get(
     "HIP_PROVIDER_SO",
-    str(PROJECT_ROOT / "src/hip/build/libonnxruntime_providers_hip.so"),
+    str(PROJECT_ROOT / "src/onnxruntime-hip/build/libonnxruntime_providers_hip.so"),
 )
 if _os.path.exists(_hip_provider_so):
     _pybind_state.register_execution_provider_library(

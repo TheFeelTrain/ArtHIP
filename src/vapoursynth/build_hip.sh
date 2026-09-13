@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds libhip.so - the standalone HIP VapourSynth plugin (Backend.HIP).
 # No ONNX Runtime involved: the ONNX model is parsed directly and run with
-# the winograd WMMA kernels from src/hip/hip_kernels.h.
+# the winograd WMMA kernels from src/common/hip_kernels.h.
 #
 # VapourSynth API4 (VapourSynth4.h / VapourSynthPluginInit2); VS_USE_LATEST_API
 # declares API 4.2 to the host (R79) like the other API4 plugins.
@@ -26,7 +26,7 @@ echo "[build] ONNX headers: ${ONNX_INC}"
 
 "${HIPCC}" --offload-arch=gfx1100 ${CXXFLAGS} \
   -I"${SRC_DIR}" \
-  -I"${SRC_DIR}/../hip" \
+  -I"${SRC_DIR}/../common" \
   -I"${VS_INC}" \
   -I"${ONNX_INC}" \
   "${SRC_DIR}/vs_hip.cpp" \

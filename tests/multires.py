@@ -5,7 +5,7 @@ What this script guarantees (REVIEW.md, "Tests performed and their limits"):
 
 * **Each backend runs in its own process.**  Combining the HIP and MIGraphX
   runtimes in one process is documented to crash at teardown
-  (``src/hip/HIP_NOTES.md``), and a per-backend process also means a backend
+  (``NOTES.md``), and a per-backend process also means a backend
   that dies cannot be mistaken for one that passed.
 * **Accuracy is asserted, not printed.**  The process exits non-zero when a
   backend's output is non-finite, differs from the CPU reference by more than
@@ -47,7 +47,7 @@ MODEL_PATH = HERE / "ArtCNN_R8F64_fp16.onnx"
 HIP_PROVIDER_SO = Path(
     os.environ.get(
         "HIP_PROVIDER_SO",
-        str(PROJECT_ROOT / "src/hip/build/libonnxruntime_providers_hip.so"),
+        str(PROJECT_ROOT / "src/onnxruntime-hip/build/libonnxruntime_providers_hip.so"),
     )
 )
 
@@ -134,7 +134,7 @@ def _register_hip_provider(ort) -> None:
     if not HIP_PROVIDER_SO.exists():
         raise SystemExit(
             f"HIP provider library not found: {HIP_PROVIDER_SO}\n"
-            "Build it first: cd src/hip && ./build.sh"
+            "Build it first: cd src/onnxruntime-hip && ./build.sh"
         )
     _pybind_state.register_execution_provider_library(
         "HIPExecutionProvider", str(HIP_PROVIDER_SO)

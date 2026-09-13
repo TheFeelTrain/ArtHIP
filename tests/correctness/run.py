@@ -3,7 +3,7 @@
 
 Each suite runs in its own process. The HIP runtime, the ONNX Runtime provider
 and VapourSynth do not always tear down cleanly when combined in one process
-(see src/hip/HIP_NOTES.md), so process-per-suite keeps runs reliable.
+(see NOTES.md), so process-per-suite keeps runs reliable.
 
 Usage
 -----

@@ -2,7 +2,7 @@
 """Intermittent-corruption hunter for the HIP execution provider.
 
 There is a rare, timing-dependent output corruption in the shared WMMA
-convolutions (see ``src/hip/HIP_NOTES.md``, "intermittent corruption").  It is
+convolutions (see ``NOTES.md``, "intermittent corruption").  It is
 environment-dependent: the same binary and input produce 0 % or up to ~40 %
 corrupt frames depending on machine state, so a single run proves nothing and a
 plain pass/fail gate cannot see it.  This script hunts for it:
@@ -62,12 +62,12 @@ CASES: dict[str, tuple[str, int]] = {
 #: regions, so it refuses the chroma/dehalo graphs when the CPU fallback is
 #: disabled (see REVIEW.md P2-17 and ``tests/correctness/test_ep.py``).  The
 #: plugin route is ``tmp/p2probe/find.py`` (chroma, 64x64), described in
-#: ``src/hip/HIP_NOTES.md``.
+#: ``NOTES.md``.
 
 
 HIP_PROVIDER_SO = Path(
     os.environ.get("HIP_PROVIDER_SO",
-                   str(PROJECT_ROOT / "src/hip/build/libonnxruntime_providers_hip.so"))
+                   str(PROJECT_ROOT / "src/onnxruntime-hip/build/libonnxruntime_providers_hip.so"))
 )
 
 
