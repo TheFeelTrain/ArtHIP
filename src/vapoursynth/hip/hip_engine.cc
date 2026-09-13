@@ -1307,6 +1307,47 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
     return false;
   };
 
+  // VSHIP_POISON=1 (diagnostic): fill every activation tensor with an fp16 NaN
+  // pattern before this frame's kernels run. A kernel that reads a tensor no op
+  // has written then produces NaN instead of silently consuming whatever the
+  // allocation or a recycled buffer happened to contain, which turns an
+  // intermittent read-before-write into a deterministic failure.
+  static const bool poison = [] { const char* e = std::getenv("VSHIP_POISON"); return e && *e == '1'; }();
+  if (poison) {
+    for (const auto& entry : tensor_map_) {
+      const int bi = entry.second.buffer_index;
+      if (bi < 0 || static_cast<size_t>(bi) >= buffers_.size()) continue;
+      hipError_t pe = hipMemsetAsync(buffers_[bi].ptr, 0x7E, buffers_[bi].size, stream);
+      if (pe != hipSuccess) return run_fail("poison memset", pe);
+    }
+  }
+
+  // VSHIP_DUMP=<dir>: write every device op's input and output tensors as raw
+  // files for the first two runs, so a wrong frame can be diffed against a good
+  // one op by op. Diagnostic only (each dump is a synchronizing device copy).
+  static const char* dump_dir = std::getenv("VSHIP_DUMP");
+  const uint64_t dump_run = (dump_dir != nullptr) ? ++dump_run_no_ : 0;
+  const bool dump = dump_dir != nullptr && dump_run <= 2;
+  auto dump_buffer = [&](const char* path, int idx) {
+    if (!dump || idx < 0 || static_cast<size_t>(idx) >= buffers_.size()) return;
+    std::vector<uint8_t> host(buffers_[idx].size);
+    // The engine's stream is hipStreamNonBlocking, so a plain hipMemcpy on the
+    // null stream would NOT be ordered after these kernels: copy on the same
+    // stream and synchronize it.
+    hipError_t e = hipMemcpyAsync(host.data(), buffers_[idx].ptr, host.size(),
+                                  hipMemcpyDeviceToHost, static_cast<hipStream_t>(stream_));
+    if (e == hipSuccess) e = hipStreamSynchronize(static_cast<hipStream_t>(stream_));
+    if (e == hipSuccess) {
+      FILE* f = std::fopen(path, "wb");
+      if (f) {
+        std::fwrite(host.data(), 1, host.size(), f);
+        std::fclose(f);
+      }
+    } else {
+      std::fprintf(stderr, "[vship] dump copy failed for %s: %s\n", path, hipGetErrorString(e));
+    }
+  };
+
   // The public boundary is NCHW for both dtypes; the compute buffers are NHWC.
   const uint32_t in_n = static_cast<uint32_t>(built_input_shape_[0]);
   const uint32_t in_c = static_cast<uint32_t>(built_input_shape_[1]);
@@ -1464,6 +1505,18 @@ bool HipEngine::Run(const void* input_data, const std::vector<int64_t>& input_sh
       if (re != hipSuccess) {
         return run_fail("HIP event record", re);
       }
+    }
+    if (dump) {
+      for (size_t bi = 0; bi < dop.input_buffers.size(); ++bi) {
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/run%llu_op%02zu_in%zu.bin", dump_dir,
+                      (unsigned long long)dump_run, dop_i, bi);
+        dump_buffer(path, dop.input_buffers[bi]);
+      }
+      char path[512];
+      std::snprintf(path, sizeof(path), "%s/run%llu_op%02zu_out.bin", dump_dir,
+                    (unsigned long long)dump_run, dop_i);
+      dump_buffer(path, dop.output_buffer);
     }
   }
 

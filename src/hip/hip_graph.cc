@@ -1228,6 +1228,25 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
                   std::string("HIP EP: ") + what + " failed: " + hipGetErrorString(e));
   };
 
+  // VSHIP_POISON=1 (diagnostic): fill every non-constant activation tensor with
+  // an fp16 NaN pattern before this frame's kernels run. A kernel that reads a
+  // tensor no op has written then produces NaN instead of silently consuming
+  // whatever the allocation or a recycled buffer happened to contain, which
+  // makes read-before-write bugs deterministic instead of intermittent.
+  static const bool poison = [] { const char* e = std::getenv("VSHIP_POISON"); return e && *e == '1'; }();
+  if (poison) {
+    for (const auto& entry : tensor_map_) {
+      const TensorInfo& info = entry.second;
+      if (info.is_constant || info.buffer_index < 0 ||
+          static_cast<size_t>(info.buffer_index) >= buffers_.size()) {
+        continue;
+      }
+      hipError_t pe = hipMemsetAsync(buffers_[info.buffer_index].ptr, 0x7E,
+                                     buffers_[info.buffer_index].size, stream);
+      if (pe != hipSuccess) return run_fail("poison memset", pe);
+    }
+  }
+
   // Upload the input into the persistent pinned staging buffer, converting
   // fp32 -> fp16 on the host when the graph input is behind a Cast. The data is
   // NCHW (ORT's layout) both before and after the conversion.
@@ -1332,6 +1351,16 @@ common::Status HipGraph::Run(const void* input_data, size_t input_bytes,
         return Status(common::ONNXRUNTIME, common::FAIL,
                       "HIP EP: kernel launch for op " + std::to_string(dop_i) + " failed: " +
                           hipGetErrorString(le));
+      }
+    }
+    // VSHIP_SYNC_EACH=1 (diagnostic): fully serialize every op with the host.
+    // If a cross-kernel memory-visibility race is present, this removes it.
+    static const bool sync_each = [] { const char* e = std::getenv("VSHIP_SYNC_EACH"); return e && *e == '1'; }();
+    if (sync_each) {
+      hipError_t se = hipStreamSynchronize(stream);
+      if (se != hipSuccess) {
+        return Status(common::ONNXRUNTIME, common::FAIL,
+                      std::string("HIP EP: sync-each failed: ") + hipGetErrorString(se));
       }
     }
     if (std::getenv("HIP_DUMPOPS")) {

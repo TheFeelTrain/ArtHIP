@@ -29,6 +29,145 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
   class to the pre-change 0.0117/0.0112. base on real jpbd frame 0: luma max
   0.00097, 0% > 0.02; U/V bit-identical (Catrom path, model not involved).
 
+## REVIEW.md follow-up (2026-09-12) — non-P1/P2 items, and a corruption hunt
+
+Gate for everything here: `tests/correctness/run.py` 82/82 and the 1920px
+EP+luma accuracy vs ORT CPU at its 0.00134 baseline. RX 7900 XTX, MANGOHUD=0,
+paired/interleaved runs.
+
+### Rare output corruption — CHARACTERIZED, NOT FIXED (top open item)
+
+The pre-existing intermittent corruption is REAL and reproduces in BOTH paths
+(standalone plugin and EP), so it lives in the shared kernels or their
+environment, not in one host path. What was measured this session:
+
+- Rate is environmental, not binary-dependent: the same .so gives 0/40 and
+  10/25 corrupt samples in different windows. Sizes matter: ~0 % at 64x64,
+  ~10 % at 512px, up to ~40 % at 1920px (EP + luma, one frame per process).
+  Nothing tried re-opened a window: GPU heat or 150 s idle, 12 CPU burners,
+  4-way concurrent GPU load, running the CPU reference first, 4-way mixed-size
+  workload rotation, 20 fresh engines in ONE process (0/20 -> not per-engine).
+- Where it lands: the EP at 1920 shows SMALL, spread perturbations
+  (max 0.003-0.016 over ~0.5-valued pixels; clean runs cap at 0.00134) confined
+  to a few pixels/rows; the plugin chroma probe at 64x64 can instead show
+  garbage-level blocks (0.05-0.5). Both are the same defect at different depths.
+- Op-level bisection (plugin, VSHIP_DUMP, chroma probe): in a corrupt process
+  the intermediate dumps are bit-identical to a clean process up to a RANDOM
+  conv op (observed first-diverging op 1, 3, 9, 10, 12, 12, 16, 18, 19, 25),
+  that op's inputs (in0/in1/in2 dumps) are bit-identical, and its output is
+  wrong; everything downstream is wrong accordingly. Run 2 in the same process
+  was bit-identical to a clean run2 (so it is a first-RUN transient, not
+  persistent bad data).
+- RULED OUT, with the artifact that ruled it out:
+  - uninitialized LDS: rebuilt with both shared arrays poisoned with fp16 NaN
+    through `volatile` pointers (fill loops verified present in the ISA as
+    `flat_store_b16 0x7e00`) -> output stayed finite and correct, 5/5. The
+    kernel never reads LDS it did not write.
+  - uninitialized global activations: `VSHIP_POISON=1` (engine + EP) fills every
+    non-constant tensor with NaN each frame -> 2/30 corrupt, same as unpoisoned.
+  - tail-wave skip: interleaved A/B, baseline 6/50 vs skip 5/50.
+  - barrier structure: every LDS phase is separated by `__syncthreads()` with
+    `s_waitcnt lgkmcnt(0)` emitted before each `s_barrier` (checked in asm);
+    strip4/v_lds coverage is complete by construction (also proven by the NaN
+    fill above).
+  - one source of FALSE evidence: the engine stream is `hipStreamNonBlocking`,
+    so a plain `hipMemcpy` dump on the null stream is NOT ordered after the
+    kernels. The dump uses `hipMemcpyAsync(..., stream_)` + sync now; the first
+    dump attempt produced bogus "non-determinism at op07" that this caused.
+- Leading remaining hypothesis: a memory-VISIBILITY race (a kernel reading a
+  value a copy or the previous kernel has written but not yet published), not a
+  logic bug — the "everything downstream is consistent with one bad input
+  value" signature and the NaN results both fit it. Untested because no window
+  was open when the sync-each knob existed.
+
+Tools for the next attempt (all env-gated, off by default):
+- `tests/corruption_hunt.py [--cases luma1920] [--rounds N] [--tolerance T]`:
+  fresh process per sample, hash-keyed ORT-CPU reference, saves corrupt frames
+  to `tests/.corrupt/`, exits non-zero on any hit. This is the way to notice a
+  window and to grade a fix.
+- `VSHIP_DUMP=<dir>` (engine): dumps every device op's inputs/output for the
+  first two runs of a frame -> diff a corrupt run against a clean one op by op.
+- `VSHIP_POISON=1` (engine + EP): NaN-fill all non-constant activation tensors
+  each frame, turning read-before-write into NaN.
+- `VSHIP_SYNC_EACH=1` (EP): `hipStreamSynchronize` after every op — the direct
+  test of the cross-kernel visibility hypothesis.
+- `tmp/p2probe/find.py` (plugin chroma 64x64), `tmp/ab_corrupt.sh <soA> <soB> N`
+  (interleaved corruption-rate A/B), `tmp/find_corrupt_ep.py` (1920px EP
+  characterisation).
+
+### Experiments run (results, all accuracy-gated)
+
+- Tail-wave skip (REVIEW "concrete candidate", SHIPPED): `winograd_conv` now
+  computes `k_wave = wave < kgroups` and the waves past the last k-group skip
+  the WMMA loop, the staging and the writeback while still joining every
+  `__syncthreads()`. Whole-frame effect: NEUTRAL — paired A/B chroma
+  22.08/21.93/21.84 (baseline) vs 22.09/21.88/21.87, base 21.51/21.26/21.55 vs
+  21.04/21.53/21.40, and the corruption A/B above. Only the M<16 tail conv
+  (one of 27) has kgroups<4, so the ceiling was ~1-2 % and the kernel is
+  latency-bound. Kept: correct by construction, passes 82/82, removes work.
+- Host-IO reuse / direct pinned staging (REVIEW suggestion, REVERTED): moved the
+  plugin's packing and writeback into engine callbacks that run under the engine
+  mutex, removing a ~8.3 MB + ~33 MB per-frame host allocation+zero and the two
+  engine memcpys. Result: NEUTRAL at num_streams=2 and **-2.5 % at
+  num_streams=1** (5 rounds: 19.94 median baseline vs 19.55 hooked) because the
+  host work moved inside the lock and stopped overlapping the GPU. The host
+  path is NOT the bottleneck: `VSHIP_HOSTPROF=1` (same knob as VSHIP_DUMP
+  instrumentation) measured in_alloc 0.64 ms + pack 0.42 ms + out_alloc 1.90 ms
+  + write 2.73 ms of ~5.7 ms/frame of host work, all hidden behind the GPU.
+  Reverted in full (engine + plugin back to `Run(memcpy, memcpy)`).
+- Engine pool sweep (REVIEW suggestion): chroma 100f paired, hip 1/2/3/4
+  engines = 19.86 / 21.66 / 21.25 / 21.10 fps. 2 is optimal (+9 % over 1); the
+  plugin/vsscale default of 2 is already right, no pool change worth making.
+- Shape-cache / weight-sharing (REVIEW suggestions): not worth code. They are
+  inside the lock (per-frame `PropagateShapes` is ~1.75 us) or startup-only, and
+  the host-path measurement above shows host time is fully hidden.
+- F16C host conversion (REVIEW suggestion): NOT implemented, because the cost it
+  targets is smaller than the review's probe suggested and is already hidden.
+  The GRAYS->fp16 pack loop is the whole f32->f16 host cost here and
+  `VSHIP_HOSTPROF` measures it at **0.42 ms per 1080p frame** (the review
+  extrapolated ~1.13 ms of saving from a scalar helper); with host work
+  overlapped by the GPU, even a free conversion buys no fps. Revisit only if
+  some path becomes host-bound.
+- Epilogue specialization (REVIEW suggestion): inspected, not implemented.
+  `do_silu`/`do_add`/geometry are uniform branches OUTSIDE the WMMA loop, the
+  kernel is at 135 VGPR with zero spills, and the historical register-diet
+  variants (R1/R1b, -11 %/-14 %) show this kernel wants more memory-level
+  parallelism, not fewer live registers. The small-M half of that suggestion is
+  the shipped tail-wave guard above.
+- rocprofv3 on the real 1080p chroma run: winograd_conv VGPR=136 (source asm
+  says 135), SGPR=128, scratch 0, LDS_BLOCK_SIZE 13824 B, ~2.97 ms per dispatch
+  in the profiled run (profiling inflates; the unprofiled frame rate implies
+  less), 27 dispatches/frame. The notes' "4.4 ms/conv, 13 % MMA util" came from
+  VSHIP_PROFILE EVENT spans, which include queue gaps — do not quote it as
+  execution time (the review's warning was right).
+
+### Numeric corrections to old text in this file
+
+- LDS per workgroup is **13,696 B** by source (3,456 strip4 + 10,240 v_lds at
+  stride 20); the hardware reports 13,824 B. Any "15,744 B / 10 KB LDS"
+  statement predates the stride-24 -> 20 change and is stale.
+- RX 7900 XTX L2 is **6 MiB** with **96 MiB Infinity Cache**, not 256 MB. A
+  1080p 64-channel fp16 tensor is ~265 MB, so it still exceeds both and the
+  "no reuse across convs" conclusion stands — but not for the reason recorded.
+- MIGraphX is at 19.3-19.7 fps (updated libvsmigx) while HIP is 21.8-22.2 on
+  the current build: +13-15 %, not the +25 % in older sections.
+
+### Test tooling changes (REVIEW "Tests performed and their limits")
+
+- `tests/multires.py` rewritten: each backend runs in its OWN process (the
+  HIP+MIGX same-process teardown crash), the CPU reference cache is keyed by
+  SHA-256 of the model file and the input tensor, accuracy is ASSERTED against
+  the reference (fail on non-finite, maxdiff > 0.01, or >0.5 % 8-bit
+  mismatches), and a session that cannot claim the graph fails instead of
+  falling back (`session.disable_cpu_ep_fallback`). `--no-speed` is the fast
+  accuracy gate; rounds alternate HIP/MIGX.
+- `tests/corruption_hunt.py` (new): the intermittent-corruption hunter above.
+- `tests/benchmark.py`: was silently SKIPPING the HIP EP (a plugin EP is absent
+  from `get_available_providers()`) and swallowed per-provider exceptions. It now
+  builds each session with the CPU fallback disabled (placement is proven, not
+  inferred from a provider name), reports failures, and exits non-zero.
+  HIP 2.28 ms/iter vs MIGX 2.73 at 256px on the 7900 XTX.
+
 ## P1 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 1-9
 
 All nine [P1] findings from REVIEW.md are fixed in the tree (the nine [P2]
@@ -249,7 +388,8 @@ Measured facts (kern_probe.s, gfx1100):
   waves fit one SIMD at 133 regs (4*133*32=17024 > 16384)? If not, how does
   HW place them (cross-SIMD WG split within CU?) — verify achieved occupancy
   with rocprofv2 (SQ_AVG_WAVES_PER_SIMD) before/after each experiment.
-- LDS 15.7 KB/WG (v_lds 12288 B c-major stride 24 + strip4 3456 B).
+- LDS 13.7 KB/WG (v_lds 10240 B [wp][nt][20] + strip4 3456 B); the 15.7 KB
+  figure predates the stride-24 -> 20 V change. Hardware reports 13,824 B.
 - Live-register inventory during WMMA: y00-y11 float8 x4 = 32,
   a0-a3 half16 x4 = 32, b0-b3 half16 x4 = 32, m0-m3 float8 x4 = 32
   => ~128 + addressing ~= 133. Fragments are the cuttable part.
@@ -344,23 +484,13 @@ FAILED / REVERTED (do not blind-retry):
 
 ## OPEN QUESTIONS
 
-- RARE nondeterminism — NOW REPRODUCIBLE (2026-09-10 P2 session), still open.
-  Original sighting: one luma 320x180 run out of ~17 differed from every other
-  run by up to 0.0041 (mostly ~3e-6 = fp16 rounding) in a localized 17x32 block.
-  Reproduction: the chroma probe (3 planes in, 2 out, fp32 clip, 64x64, fixed
-  seed) yields a corrupted frame every ~30 runs — 3-5% of pixels off by
-  0.02-0.11, scattered, different values per process, but bit-identical for two
-  frames fetched from the same process. Seen at ~1/37 with a stashed PRE-P2
-  build, ~1/29 with the P2 build, and 0/80 in a follow-up run of the P2 build,
-  so it predates the P2 fixes and sits somewhere under ~3%. Signature =
-  reading state that was never written (per-process VRAM/LDS contents), not a
-  missing barrier (the winograd barriers and LDS coverage were audited; the only
-  unwritten bytes are the 4-half v_lds row padding and unwritten small-M tail
-  channels, neither of which is stored). Note (same session): the DIRECT plugin
-  is bit-deterministic on a 1080p photo (12/12), so this is not a general
-  determinism failure; it is a rare, input/shape-specific corruption. Next step:
-  capture the bad frame, then dump an intermediate tensor on a bad run or use
-  `rocprofv2` LDS counters. Repro: `tmp/p2probe/find.py`.
+- RARE nondeterminism / intermittent corruption — INVESTIGATED 2026-09-12, see
+  "REVIEW.md follow-up (2026-09-12) -> Rare output corruption" at the top. It
+  reproduces in the EP as well as the plugin, is a first-run-per-process
+  transient at a random conv op, is NOT uninitialized LDS or uninitialized
+  global memory, and correlates with nothing controllable (heat, idle, CPU/GPU
+  load, engine count). Hunt with `tests/corruption_hunt.py`; the leading
+  hypothesis is a memory-visibility race, testable with `VSHIP_SYNC_EACH=1`.
 - Actual resident waves/SIMD for winograd_conv (rocprofv2) — 3 predicted
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
 - Why did vs_ab_check segfault intermittently at teardown in 4-backend
@@ -522,8 +652,8 @@ BIG-LEVER ANALYSIS (2026-09-06, all measured, no code):
   (register/LDS blowup) or a different tile (F(2x4) needs LDS redesign).
 - Megakernel/persistent: KILLED by scaling data. Time is linear in pixels
   (34 Mpix/s from 0.26 to 2 Mpix/frame; 2-wide batch = 2x serial) and each
-  conv's working set (265MB in + 265MB out) exceeds the 256MB L2 — NO reuse
-  is possible across convs (weights 0.13MB are the only reusable bytes, and
+  conv's working set (265MB in + 265MB out) exceeds the 6MB L2 AND the 96MB
+  Infinity Cache — NO reuse is possible across convs (weights 0.13MB are the only reusable bytes, and
   they already stay L2-resident within a conv). Gap-hunting bounds the prize:
   s=1-vs-s=2 overlap is worth 9% and we already bank it; residual graph
   overhead is ~1%. NOT next.
@@ -540,8 +670,9 @@ MEASURED FACTS (rocprofv3, 8 frames @1080p, no-bounds build 2026-09-06):
   4.35ms, ops21-25 taper 4.2/3.3/2.2/2.2/2.2 (smaller H/feature maps deeper
   in the chain), op26 4.2, DTS 1.34ms. Event spans include queue gaps; trust
   shape (flat-then-taper), not absolutes (sums exceed wall time).
-- VGPR (true shipping-kernel disasm tmp/winograd.s, gfx1100): winograd 134
-  (alloc granule 176 = 6 waves/SIMD), no spills. LDS 15744 (4 WGs/CU).
+- VGPR (winograd.s disasm, gfx1100): 135 in the current build, no spills;
+  rocprofv3 reports 136/128 and LDS_BLOCK_SIZE 13824. The old 134/15744
+  pair predates the stride-20 V and the tail-wave guard.
   WMMA VGPR banks (LLVM#204254): 3 of 4 WMMAs have A/C on bank 1 (collision,
   +2c each); B on bank 2. Fix needs inline asm (can't steer regalloc from
   source) — expected gain ~6% of WMMA time only (~1.2ms of 4.4ms), NOT next.

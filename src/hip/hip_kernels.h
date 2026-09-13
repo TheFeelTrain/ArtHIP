@@ -126,7 +126,13 @@ __global__ void winograd_conv(
   const uint tiles_w8 = (p.tiles_w + 7u) / 8u;
   if (tiles_w8 == 0u) return;
   const uint kgroups = p.M_pad / 16u;
-  const uint kgroup = min(wave, kgroups - 1u);
+  // Small-M tails (M_pad < 64) have fewer than four k-groups, so the waves
+  // beyond the last one would duplicate an existing group's WMMA/accumulator
+  // and writeback work. They still have to take part in the strip/V
+  // construction and every __syncthreads(), but the multiply work itself is
+  // pure waste for them.
+  const bool k_wave = (wave < kgroups);
+  const uint kgroup = k_wave ? wave : (kgroups - 1u);
   const uint row_pair = wg / tiles_w8;
   const uint tw_group = wg % tiles_w8;
   const uint th_a = row_pair * 2u;
@@ -208,6 +214,7 @@ __global__ void winograd_conv(
     // ---- WMMA: 4 wp groups, A from U (this wave's k-block), B from v_lds ----
     // A: lane l holds U[ko=l%16][c=0..15] for (kblock=kgroup, wp, cb)
     const uint ub = kgroup * (c_blocks * 4096u) + cb_off * 4u;
+    if (k_wave) {
 #pragma unroll 1
     for (uint wpi = 0u; wpi < 4u; ++wpi) {
       half16_t a0, a1, a2, a3;
@@ -238,6 +245,7 @@ __global__ void winograd_conv(
       wmma_mul(a3, b3, m3);
       FOLD4(y00, y01, y10, y11, wpi, m0, m1, m2, m3);
     }
+    }
 
     // Prefetch the next c-block's strip; its global-load latency overlaps the
     // WMMA drain (strip4 is free: the current strip was consumed above).
@@ -250,7 +258,7 @@ __global__ void winograd_conv(
   // Stage the 4 y matrices ColumnMajor into this wave's v_lds region:
   // element (ko, nt) at nt*16 + ko, so each writeback vec4 (4 consecutive ko)
   // is one contiguous 8-byte LDS read. 4 matrices x 256 fp16 = 1KB per wave.
-  {
+  if (k_wave) {
     const uint nt = lane % 16u;
     const uint koff = k_base + lane / 16u;
     const uint yb = wave * 1024u;
@@ -269,6 +277,7 @@ __global__ void winograd_conv(
 
   // 64 (nt, k4) combos per wave; each lane handles 2.
   const uint yb = wave * 1024u;
+  if (k_wave) {
   for (uint idx = lane; idx < 64u; idx += 32u) {
     const uint nt_local = idx / 4u;
     const uint k4 = idx % 4u;
@@ -354,6 +363,7 @@ __global__ void winograd_conv(
         else for (uint q = 0u; q < 4u; ++q) if (k + q < p.M) out[o3 + k + q] = v11[q];
       }
     }
+  }
   }
 }
 

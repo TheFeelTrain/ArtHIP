@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent
 
 # Cache MIGraphX's compiled program. The model has dynamic input dims, so the
-# ORT cache key is identical across resolutions -- use a per-size dir.
+# ORT cache key is identical across sizes -- use a per-size dir.
 _mxr_cache_root = HERE / ".mxr_cache"
 _mxr_cache_root.mkdir(exist_ok=True)
 
@@ -108,13 +108,33 @@ print()
 _quiet_sess_opts = ort.SessionOptions()
 _quiet_sess_opts.log_severity_level = 3
 
+
+def _strict_session(provider, provider_opts):
+    """A session that fails unless `provider` claims the WHOLE graph.
+
+    ``get_providers()`` still lists a provider that claimed nothing (those nodes
+    simply run elsewhere), so a provider name proves nothing about placement.
+    Disabling the CPU fallback turns "this EP did not take the graph" into an
+    explicit session-creation failure.  A plugin execution provider - the HIP EP
+    is one - is also absent from ``get_available_providers()``, so availability
+    is decided by trying the session rather than by that list.
+    """
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        str(model_path), options, providers=[(provider, provider_opts)]
+    )
+    claimed = session.get_providers()
+    if not claimed or claimed[0] != provider:
+        raise RuntimeError(f"{provider} did not claim the graph (providers: {claimed})")
+    return session
+
+
 results = {}
+failures = []
 
 for provider in providers_to_test:
-
-    if provider not in available_providers and provider != "IREE":
-        print(f"[SKIP]  {provider} is not available on this system.\n")
-        continue
 
     if provider == "IREE" and not _iree_available:
         print("[SKIP]  IREE is not available (set IREE_PROVIDER_SO / IREE_COMPILER_SO).\n")
@@ -156,11 +176,9 @@ for provider in providers_to_test:
                 _mxr_cache = _mxr_cache_root / f"{h}x{w}"
                 _mxr_cache.mkdir(exist_ok=True)
                 opts["migraphx_model_cache_dir"] = str(_mxr_cache)
-            session = ort.InferenceSession(
-                str(model_path),
-                sess_options=_quiet_sess_opts,
-                providers=[(provider, opts)],
-            )
+            # Placement is proven, not assumed: this raises when the provider
+            # declines a node instead of silently timing a fallback.
+            session = _strict_session(provider, opts)
 
         input_info = session.get_inputs()[0]
         input_name = input_info.name
@@ -240,8 +258,11 @@ for provider in providers_to_test:
         print(f"        Saved output to {out_path}\n")
 
     except Exception as e:
+        # Fail fast: report, remember, and exit non-zero below. A swallowed
+        # failure used to leave the summary looking like a successful run.
         print(f"[ERROR] Failed to benchmark {provider}:")
         print(f"        {type(e).__name__}: {e}\n")
+        failures.append(f"{provider}: {type(e).__name__}: {e}")
 
     finally:
         if session is not None:
@@ -267,3 +288,10 @@ for provider, elapsed in sorted(
         f"{elapsed:7.16f} s  "
         f"({per_iter_ms:7.16f} ms/iter)"
     )
+
+if failures:
+    print()
+    print(f"{len(failures)} provider(s) failed:")
+    for line in failures:
+        print(f"  {line}")
+    sys.exit(1)

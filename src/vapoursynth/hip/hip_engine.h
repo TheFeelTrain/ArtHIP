@@ -181,6 +181,8 @@ class HipEngine {
   std::vector<void*> prof_events_;
   uint64_t trace_run_no_ = 0;
   uint64_t prof_frame_no_ = 0;
+  // VSHIP_DUMP: per-engine run counter for the intermediate-tensor dump.
+  uint64_t dump_run_no_ = 0;
 
   std::mutex mutex_;
 };

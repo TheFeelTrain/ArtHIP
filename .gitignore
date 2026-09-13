@@ -11,3 +11,8 @@ __pycache__/
 
 ArtCNN_R8F64_fp16*.png
 .dsh-managed-access.json
+
+# Test reference caches (regenerated; keyed by model+input hash)
+tests/.cpu_ref_*.json
+tests/.hunt_ref_*
+tests/.corrupt/
