@@ -9,15 +9,17 @@ kernels. Currently beats the MIGraphX reference plugin (~23.0 vs ~15.7 fps @1080
 - `src/common/` — `hip_kernels.h`, the gfx1100 Winograd WMMA kernels shared by
   both backends below.
 - `src/onnxruntime-hip/` — the ONNX Runtime execution provider
-  (`hip_graph.cc`, `hip_execution_provider.cc`, `hip_provider_factory.cc`),
-  its `build.sh`, and standalone WMMA micro-benches.
+  (`hip_graph.cc`, `hip_execution_provider.cc`, `hip_provider_factory.cc`) and
+  its `build.sh`.
 - `src/vapoursynth/` — the standalone VapourSynth plugin (`vs_hip.cpp`
   + `hip_engine.cc/h`, no ORT involved), shared ONNX helpers
   (`onnx_utils`, `convert_float_to_float16`), and `build_hip.sh`.
+- `tests/` — `fixtures/` (ONNX models + reference images), `tools/` (manual
+  benches and comparison scripts), `correctness/` (the pytest gate).
+  See `tests/README.md`.
 - `NOTES.md` — experiment log; read this before touching kernels.
-- `tests/` — `benchmark.py` + `multires.py` (HIP EP vs MIGraphX EP via ORT),
-  `vs_test.py` (`VS_BACKEND=hip|migx` VapourSynth comparison), test images,
-  `.mxr_cache/` (MIGraphX compiled programs — 7.6GB, saves recompiles).
+- `third_party/onnxruntime/` — the ORT 1.29.0 source tree the EP build links
+  against (git-ignored, not committed).
 
 ## Build / Test
 
@@ -27,8 +29,8 @@ kernels. Currently beats the MIGraphX reference plugin (~23.0 vs ~15.7 fps @1080
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
 - Provider (ORT EP): `cd src/onnxruntime-hip && ./build.sh`
 - VapourSynth comparison: `VS_BACKEND=<hip|migx> vspipe -p
-  tests/vs_test.py --` (500 blank 1920x1080 frames)
-- EP accuracy/speed: `python tests/multires.py 1920`
+  tests/tools/vs_test.py --` (500 blank 1920x1080 frames)
+- EP accuracy/speed: `python tests/tools/multires.py 1920`
 
 ## Notes
 

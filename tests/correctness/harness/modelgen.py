@@ -188,7 +188,7 @@ def _conv_m128(out: Path) -> Fixture:
 
 @fixture("conv_1x1")
 def _conv_1x1(out: Path) -> Fixture:
-    """A legal 1x1 Conv with explicit pad 1 (REVIEW.md P1-2 crash case)."""
+    """A legal 1x1 Conv with explicit pad 1 (P1-2 crash case)."""
     return _single_conv(out, "conv_1x1", m=4, c=4, seed=31, bias="none", kernel=1)
 
 
@@ -509,7 +509,7 @@ def _ep_conv_fp32io(out: Path) -> Fixture:
     converter emits for an fp32 clip.
 
     One input AND one output channel on purpose: the EP's supported layout is
-    single-activation (REVIEW.md P1-17) and its multi-channel buffer conversion
+    single-activation (P1-17) and its multi-channel buffer conversion
     is a separate open finding (P2-11). Keeping both at 1 isolates the fp16->fp32
     boundary conversion, which is what the P1-4 checks are about.
     """

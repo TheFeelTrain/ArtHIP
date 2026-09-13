@@ -9,16 +9,22 @@ from pathlib import Path
 # Configuration
 # ============================================================
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent
+HERE = Path(__file__).resolve().parent  # tests/tools
+TESTS_DIR = HERE.parent  # tests/
+PROJECT_ROOT = TESTS_DIR.parent  # repository root
+FIXTURES_DIR = TESTS_DIR / "fixtures"
+MODELS_DIR = FIXTURES_DIR / "models"
+IMAGES_DIR = FIXTURES_DIR / "images"
+OUT_DIR = TESTS_DIR / "out"  # generated, git-ignored
+OUT_DIR.mkdir(exist_ok=True)
 
 # Cache MIGraphX's compiled program. The model has dynamic input dims, so the
 # ORT cache key is identical across sizes -- use a per-size dir.
-_mxr_cache_root = HERE / ".mxr_cache"
+_mxr_cache_root = TESTS_DIR / ".mxr_cache"
 _mxr_cache_root.mkdir(exist_ok=True)
 
-model_path = HERE / "ArtCNN_R8F64_fp16.onnx"
-input_image_path = sys.argv[1] if len(sys.argv) > 1 else str(HERE / "test_1024.png")
+model_path = MODELS_DIR / "ArtCNN_R8F64_fp16.onnx"
+input_image_path = sys.argv[1] if len(sys.argv) > 1 else str(IMAGES_DIR / "test_1024.png")
 num_iterations = 100
 
 providers_to_test = [
@@ -245,7 +251,7 @@ for provider in providers_to_test:
         output_img = np.round(pred_out * 255.0).astype(np.uint8)
 
         out_path = (
-            str(HERE / f"{model_path.stem}_{provider}_fp16.png")
+            str(OUT_DIR / f"{model_path.stem}_{provider}_fp16.png")
         )
 
         success = cv2.imwrite(out_path, output_img)

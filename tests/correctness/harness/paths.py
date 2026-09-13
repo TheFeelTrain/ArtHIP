@@ -20,9 +20,9 @@ SCRIPT_DIR = BUILD_DIR / "scripts"
 #   dehalo  3 input planes -> 3 output planes (RGB/YUV, 1:1)
 #   chroma  3 input planes -> 2 output planes (YUV 4:4:4, emits U and V)
 SHIPPED_MODELS = {
-    "luma": TESTS_DIR / "ArtCNN_R8F64_fp16.onnx",
-    "dehalo": TESTS_DIR / "ArtCNN_R8F64_YCbCr_DEHALO.onnx",
-    "chroma": TESTS_DIR / "ArtCNN_R8F64_Chroma.onnx",
+    "luma": TESTS_DIR / "fixtures/models/ArtCNN_R8F64_fp16.onnx",
+    "dehalo": TESTS_DIR / "fixtures/models/ArtCNN_R8F64_YCbCr_DEHALO.onnx",
+    "chroma": TESTS_DIR / "fixtures/models/ArtCNN_R8F64_Chroma.onnx",
 }
 
 # Production artifacts and their build scripts.

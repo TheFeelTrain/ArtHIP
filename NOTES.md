@@ -29,7 +29,7 @@ Accuracy (tmp/acc_gen.py, per-backend processes, stride-aware):
   class to the pre-change 0.0117/0.0112. base on real jpbd frame 0: luma max
   0.00097, 0% > 0.02; U/V bit-identical (Catrom path, model not involved).
 
-## REVIEW.md follow-up (2026-09-12) — non-P1/P2 items, and a corruption hunt
+## Review follow-up (2026-09-12) — non-P1/P2 items, and a corruption hunt
 
 Gate for everything here: `tests/correctness/run.py` 82/82 and the 1920px
 EP+luma accuracy vs ORT CPU at its 0.00134 baseline. RX 7900 XTX, MANGOHUD=0,
@@ -81,9 +81,9 @@ environment, not in one host path. What was measured this session:
   was open when the sync-each knob existed.
 
 Tools for the next attempt (all env-gated, off by default):
-- `tests/corruption_hunt.py [--cases luma1920] [--rounds N] [--tolerance T]`:
+- `tests/tools/corruption_hunt.py [--cases luma1920] [--rounds N] [--tolerance T]`:
   fresh process per sample, hash-keyed ORT-CPU reference, saves corrupt frames
-  to `tests/.corrupt/`, exits non-zero on any hit. This is the way to notice a
+  to `tests/.cache/corrupt/`, exits non-zero on any hit. This is the way to notice a
   window and to grade a fix.
 - `VSHIP_DUMP=<dir>` (engine): dumps every device op's inputs/output for the
   first two runs of a frame -> diff a corrupt run against a clean one op by op.
@@ -154,23 +154,23 @@ Tools for the next attempt (all env-gated, off by default):
 
 ### Test tooling changes (REVIEW "Tests performed and their limits")
 
-- `tests/multires.py` rewritten: each backend runs in its OWN process (the
+- `tests/tools/multires.py` rewritten: each backend runs in its OWN process (the
   HIP+MIGX same-process teardown crash), the CPU reference cache is keyed by
   SHA-256 of the model file and the input tensor, accuracy is ASSERTED against
   the reference (fail on non-finite, maxdiff > 0.01, or >0.5 % 8-bit
   mismatches), and a session that cannot claim the graph fails instead of
   falling back (`session.disable_cpu_ep_fallback`). `--no-speed` is the fast
   accuracy gate; rounds alternate HIP/MIGX.
-- `tests/corruption_hunt.py` (new): the intermittent-corruption hunter above.
-- `tests/benchmark.py`: was silently SKIPPING the HIP EP (a plugin EP is absent
+- `tests/tools/corruption_hunt.py` (new): the intermittent-corruption hunter above.
+- `tests/tools/benchmark.py`: was silently SKIPPING the HIP EP (a plugin EP is absent
   from `get_available_providers()`) and swallowed per-provider exceptions. It now
   builds each session with the CPU fallback disabled (placement is proven, not
   inferred from a provider name), reports failures, and exits non-zero.
   HIP 2.28 ms/iter vs MIGX 2.73 at 256px on the 7900 XTX.
 
-## P1 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 1-9
+## P1 review fixes (2026-09-10, SHIPPED) — review items 1-9
 
-All nine [P1] findings from REVIEW.md are fixed in the tree (the nine [P2]
+All nine [P1] review findings are fixed in the tree (the nine [P2]
 findings were fixed in the follow-up session — see the P2 section below; the
 performance items from the review are still open). The engine/EP now REJECT
 what they cannot compute correctly instead of reading out of bounds or silently
@@ -248,7 +248,7 @@ HIP-vs-CPU 0.00098 = MIGX-vs-CPU 0.00098. Paired 100f: base hip 21.6-21.9 vs
 migx 14.7, chroma hip 22.0 vs migx 19.1 — unchanged from the pre-fix build, so
 the added validation costs nothing measurable.
 
-## P2 review fixes (2026-09-10, SHIPPED) — REVIEW.md items 10-18
+## P2 review fixes (2026-09-10, SHIPPED) — review items 10-18
 
 All nine [P2] findings are fixed in the tree. The correctness suite is now 82
 checks (48 engine / 8 EP / 26 plugin) and passes; the strict xfail that tracked
@@ -310,7 +310,7 @@ is accepted", passes on both — it guards against over-strict rejection).
   per-engine instead of function-static (they raced across engines, each holding
   a different mutex).
 
-Gate after the P2 fixes (RX 7900 XTX): photo `tests/test_1920.png` GRAYS -> 2x,
+Gate after the P2 fixes (RX 7900 XTX): photo `tests/fixtures/images/test_1920.png` GRAYS -> 2x,
 HIP vs MIGX max absdiff **0.002441** (= the documented 0.0024, unchanged); 200
 blank 1080p frames hip **22.3 fps** vs migx 8.4; EP `multires.py 256`
 HIP-vs-CPU 0.00098 (= MIGX-vs-CPU) at 1.78 ms/iter vs MIGX 2.57; suite 82/82.
@@ -367,7 +367,7 @@ MIGX; base real jpbd luma 0.00097; dehalo RGBS 0.0034/0.0044/0.0039, 0% > 0.02).
 All input paths re-checked: GRAY8/GRAY16/GRAYH/GRAYS in, GRAYH/GRAYS out,
 num_streams 1-2, Version/DeviceProperties, 0-clip + missing-path errors clean.
 fp16=0 status (CORRECTED 2026-09-10 in the P2 session; the old "output is ~0,
-do not use fp16=0" claim was stale — REVIEW.md P2-12 had already flagged it, and
+do not use fp16=0" claim was stale — P2-12 had already flagged it, and
 `WeightFloat()` reads fp32 weight storage fine). Measured on the shipped models
 with fp16=0 vs fp16=1: luma GRAY8 -> Gray16 vs GrayH, means identical; chroma
 YUV444PS -> GrayS both, means within 5e-5; dehalo YUV444PS -> RGBS both, means
@@ -485,11 +485,11 @@ FAILED / REVERTED (do not blind-retry):
 ## OPEN QUESTIONS
 
 - RARE nondeterminism / intermittent corruption — INVESTIGATED 2026-09-12, see
-  "REVIEW.md follow-up (2026-09-12) -> Rare output corruption" at the top. It
+  "Review follow-up (2026-09-12) -> Rare output corruption" at the top. It
   reproduces in the EP as well as the plugin, is a first-run-per-process
   transient at a random conv op, is NOT uninitialized LDS or uninitialized
   global memory, and correlates with nothing controllable (heat, idle, CPU/GPU
-  load, engine count). Hunt with `tests/corruption_hunt.py`; the leading
+  load, engine count). Hunt with `tests/tools/corruption_hunt.py`; the leading
   hypothesis is a memory-visibility race, testable with `VSHIP_SYNC_EACH=1`.
 - Actual resident waves/SIMD for winograd_conv (rocprofv2) — 3 predicted
   from 133 VGPRs; verify, plus LDS bank-conflict counts for B gather.
@@ -520,10 +520,10 @@ Working notes for `src/vapoursynth/` (VapourSynth plugin) and
   `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`; shared by the plugin and the
   execution-provider code.
 - Provider (ORT EP): `src/onnxruntime-hip/build.sh` (ORT v1.29.0 sources in git-ignored
-  `tmp/ort129`; vtable defines `-DENABLE_TRAINING -DORT_USE_NCCL
+  `third_party/onnxruntime`; vtable defines `-DENABLE_TRAINING -DORT_USE_NCCL
   -DENABLE_STRIDED_TENSORS` + `-mf16c -mavx2` to match Arch onnxruntime-rocm
   1.29.0, like vulkanonnx `build_provider_system.sh`; links
-  libonnxruntime_providers_shared). `tests/multires.py` fail-fasts if the
+  libonnxruntime_providers_shared). `tests/tools/multires.py` fail-fasts if the
   .so is missing / registration fails / the session falls back from HIP.
 - Install: `cp src/vapoursynth/build/libhip.so
   /usr/lib/python3.14/site-packages/vapoursynth/plugins/libhip.so`
@@ -532,8 +532,8 @@ Working notes for `src/vapoursynth/` (VapourSynth plugin) and
   (`HIP = hip.HIP`; upstream hip.py existed but was unwired).
   NOTE: like the VULKAN entries, a vsjetpack update resets base.py -
   re-add the import + `HIP = hip.HIP` line after every update.
-- Run: `MANGOHUD=0 VS_BACKEND=hip vspipe -p tests/vs_test.py --`
-  (tests/vs_test.py already routes `hip` to Backend.HIP).
+- Run: `MANGOHUD=0 VS_BACKEND=hip vspipe -p tests/tools/vs_test.py --`
+  (tests/tools/vs_test.py already routes `hip` to Backend.HIP).
 
 ## Speed session (2026-09-06) - HIP 19.4 vs MIGX 15.5 (+25%, cooled pair)
 
@@ -697,7 +697,7 @@ NEXT (not tried, in priority order):
 
 ## Multi-channel models (2026-09-06: chroma SHIPPED, dehalo SHIPPED)
 
-DEHALO 3ch->3ch (ArtCNN_R8F64_YCbCr_DEHALO.onnx @ workspace root, 2026-09-06):
+DEHALO 3ch->3ch (tests/fixtures/models/ArtCNN_R8F64_YCbCr_DEHALO.onnx, 2026-09-06):
 engine needed NO changes (27 Conv + SiLU + Adds, tail Clip, C=3 in/out —
 all already supported; tail weight [3,64,3,3] exercises the M<16
 vector-tail writeback path). Pure PLUGIN gaps, fixed in vs_hip.cpp:
@@ -838,7 +838,7 @@ routed every non-migx backend to VULKAN until fixed. Always verify
   248 W. HIP busy% has NEVER been sampled; do not quote 89% for HIP.
   Fold into the R10 rocprofv2/sysfs pass.
 - Design reference if ever needed: TicketSemaphore + instances vector in
-  reference/vs-mlrt/vsmigx/vs_migraphx.cpp.
+  reference/vs-mlrt-api4/vsmigx/vs_migraphx.cpp.
 
 ### Debug/env knobs (all default off)
 - `VSHIP_PROFILE=1` per-op HIP event timestamps in HipEngine::Run.

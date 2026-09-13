@@ -1,18 +1,22 @@
 build/
+
+# Local-only data, vendored sources and scratch (never committed)
 reference/
 tmp/
+third_party/
 
-.mxr_cache/
+# rocprof output
+.rocprofv3/
 
 # Python test tooling
 __pycache__/
 *.py[co]
 .pytest_cache/
 
-ArtCNN_R8F64_fp16*.png
+# Local DSH state
 .dsh-managed-access.json
 
-# Test reference caches (regenerated; keyed by model+input hash)
-tests/.cpu_ref_*.json
-tests/.hunt_ref_*
-tests/.corrupt/
+# Test caches and generated outputs (regenerated; never committed)
+tests/.mxr_cache/
+tests/.cache/
+tests/out/

@@ -1,6 +1,6 @@
 """Standalone ``HipEngine`` correctness checks.
 
-Test names carry the ``REVIEW.md`` finding they cover (``p1_03`` = finding 3) so
+Test names carry the P1/P2 review finding they cover (``p1_03`` = finding 3) so
 a failure points straight back at the review item that motivated the check.
 """
 

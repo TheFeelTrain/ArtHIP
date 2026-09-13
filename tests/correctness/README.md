@@ -4,7 +4,7 @@ Executable checks for the HIP plugin and execution provider. They run against
 the **real** engine, the real gfx1100 kernels, the real ONNX Runtime provider
 and the real VapourSynth plugin — no CPU shim.
 
-Every test is named after the `REVIEW.md` finding it covers (`test_p1_03_...` =
+Every test is named after the P1/P2 review finding it covers (`test_p1_03_...` =
 finding 3, `test_p2_11_...` = P2 finding 11), so a failure points straight back
 at the review item that motivated the check. The suite currently runs 82 checks
 (48 engine, 8 EP, 26 plugin) covering the P1 and P2 findings.
@@ -40,8 +40,8 @@ failed), `pytest`, `onnxruntime` (EP suite and the chroma CPU reference), and
 | `ep` | `test_ep.py` | The ONNX Runtime provider: fp32 boundary conversion, device fallback, shape rebuilds, multi-channel layout conversion, partition boundaries. 8 checks. |
 | `plugin` | `test_plugin.py` | The VapourSynth plugin: which clip formats/plane counts are accepted and rejected, the shipped multi-plane models and their chroma planes, fp16 multi-channel layout, integer-clip packing, option defaults and tiling arguments, flexible-output plane count. 26 checks. |
 
-Performance is deliberately out of scope — see `tests/multires.py`,
-`tests/benchmark.py` and `tests/vs_test.py` for speed/accuracy runs.
+Performance is deliberately out of scope — see `tests/tools/multires.py`,
+`tests/tools/benchmark.py` and `tests/tools/vs_test.py` for speed/accuracy runs.
 
 ## Shipped models
 

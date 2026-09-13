@@ -14,14 +14,14 @@ plain pass/fail gate cannot see it.  This script hunts for it:
   stale reference,
 * a sample is reported corrupt when the maximum absolute difference is above
   ``--tolerance`` (default 0.003) *or* the output is not finite,
-* corrupt samples are saved to ``tests/.corrupt/`` for offline analysis.
+* corrupt samples are saved to ``tests/.cache/corrupt/`` for offline analysis.
 
 Usage
 -----
-    python tests/corruption_hunt.py                 # luma 1920, 50 samples
-    python tests/corruption_hunt.py --rounds 100
-    python tests/corruption_hunt.py --cases luma64 chroma64 dehalo64
-    python tests/corruption_hunt.py --list
+    python tests/tools/corruption_hunt.py                 # luma 1920, 50 samples
+    python tests/tools/corruption_hunt.py --rounds 100
+    python tests/tools/corruption_hunt.py --cases luma64 chroma64 dehalo64
+    python tests/tools/corruption_hunt.py --list
 
 Exit status is 1 when at least one corrupt sample was found, so it can be used
 as a gate once the rate is known to be non-zero in the current environment.
@@ -39,15 +39,20 @@ from pathlib import Path
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent
-CORRUPT_DIR = HERE / ".corrupt"
+HERE = Path(__file__).resolve().parent  # tests/tools
+TESTS_DIR = HERE.parent  # tests/
+PROJECT_ROOT = TESTS_DIR.parent  # repository root
+FIXTURES_DIR = TESTS_DIR / "fixtures"
+MODELS_DIR = FIXTURES_DIR / "models"
+IMAGES_DIR = FIXTURES_DIR / "images"
+CACHE_DIR = TESTS_DIR / ".cache"  # generated, git-ignored
+CORRUPT_DIR = CACHE_DIR / "corrupt"
 MARK = "__ARTHIP_HUNT__"
 
 MODELS = {
-    "luma": HERE / "ArtCNN_R8F64_fp16.onnx",
-    "chroma": HERE / "ArtCNN_R8F64_Chroma.onnx",
-    "dehalo": HERE / "ArtCNN_R8F64_YCbCr_DEHALO.onnx",
+    "luma": MODELS_DIR / "ArtCNN_R8F64_fp16.onnx",
+    "chroma": MODELS_DIR / "ArtCNN_R8F64_Chroma.onnx",
+    "dehalo": MODELS_DIR / "ArtCNN_R8F64_YCbCr_DEHALO.onnx",
 }
 
 #: (case name, model key, size in px).  A case name is ``<model><size>``.
@@ -60,7 +65,7 @@ CASES: dict[str, tuple[str, int]] = {
 #: Multi-channel models are exercised through the VapourSynth plugin, not here:
 #: the execution provider deliberately claims only single-activation-input
 #: regions, so it refuses the chroma/dehalo graphs when the CPU fallback is
-#: disabled (see REVIEW.md P2-17 and ``tests/correctness/test_ep.py``).  The
+#: disabled (see P2-17 and ``tests/correctness/test_ep.py``).  The
 #: plugin route is ``tmp/p2probe/find.py`` (chroma, 64x64), described in
 #: ``NOTES.md``.
 
@@ -87,7 +92,7 @@ def make_input(model_key: str, size: int) -> np.ndarray:
     values the production filter sees) and seeded noise otherwise.
     """
     channels = 1 if model_key == "luma" else 3
-    img_path = HERE / f"test_{size}.png"
+    img_path = IMAGES_DIR / f"test_{size}.png"
     if img_path.exists():
         import cv2
 
@@ -111,8 +116,8 @@ def make_input(model_key: str, size: int) -> np.ndarray:
 
 
 def ref_paths(model_key: str, size: int) -> tuple[Path, Path]:
-    return (HERE / f".hunt_ref_{model_key}{size}.npy",
-            HERE / f".hunt_ref_{model_key}{size}.json")
+    return (CACHE_DIR / f"hunt_ref_{model_key}{size}.npy",
+            CACHE_DIR / f"hunt_ref_{model_key}{size}.json")
 
 
 def load_reference(model_key: str, size: int, model_sha: str, input_sha: str):
@@ -184,6 +189,7 @@ def build_reference(model_key: str, size: int) -> None:
     cpu = ort.InferenceSession(str(model), opts, providers=["CPUExecutionProvider"])
     ref = np.asarray(cpu.run(None, {"input": x})[0])
     npy, sidecar = ref_paths(model_key, size)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     np.save(npy, ref)
     sidecar.write_text(json.dumps(
         {"model_sha256": model_sha, "input_sha256": input_sha, "shape": list(ref.shape)}, indent=2) + "\n")

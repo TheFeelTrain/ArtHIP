@@ -2,13 +2,13 @@
 # Builds libonnxruntime_providers_hip.so - the HIPExecutionProvider for ONNX Runtime.
 #
 # Usage: ./build.sh [ort_source_dir]
-#   ort_source_dir defaults to ../../tmp/ort129 (onnxruntime v1.29.0, matching
-#   the installed onnxruntime-rocm 1.29.0 package). Pass an explicit path to
-#   build against a different source tree.
+#   ort_source_dir defaults to ../../third_party/onnxruntime (onnxruntime
+#   v1.29.0, matching the installed onnxruntime-rocm 1.29.0 package). Pass an
+#   explicit path to build against a different source tree.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ORT_SRC="${1:-${SRC_DIR}/../../tmp/ort129}"
+ORT_SRC="${1:-${SRC_DIR}/../../third_party/onnxruntime}"
 BUILD_DIR="${SRC_DIR}/build"
 HIPCC="${HIPCC:-hipcc}"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Multi-resolution accuracy + speed check for the HIP execution provider.
 
-What this script guarantees (REVIEW.md, "Tests performed and their limits"):
+What this script guarantees:
 
 * **Each backend runs in its own process.**  Combining the HIP and MIGraphX
   runtimes in one process is documented to crash at teardown
@@ -19,11 +19,11 @@ What this script guarantees (REVIEW.md, "Tests performed and their limits"):
 
 Usage
 -----
-    python tests/multires.py                     # 256 512 1024, default frames
-    python tests/multires.py 256 512             # selected resolutions
-    python tests/multires.py 1920 --frames 120 --rounds 3
-    python tests/multires.py --list              # show what would run
-    python tests/multires.py --no-speed          # accuracy gate only
+    python tests/tools/multires.py                     # 256 512 1024, default frames
+    python tests/tools/multires.py 256 512             # selected resolutions
+    python tests/tools/multires.py 1920 --frames 120 --rounds 3
+    python tests/tools/multires.py --list              # show what would run
+    python tests/tools/multires.py --no-speed          # accuracy gate only
 
 MIGraphX is optional: when it is unavailable the HIP checks still run and are
 still asserted, and the MIGraphX comparison is reported as skipped.
@@ -41,9 +41,14 @@ from pathlib import Path
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent
-MODEL_PATH = HERE / "ArtCNN_R8F64_fp16.onnx"
+HERE = Path(__file__).resolve().parent  # tests/tools
+TESTS_DIR = HERE.parent  # tests/
+PROJECT_ROOT = TESTS_DIR.parent  # repository root
+FIXTURES_DIR = TESTS_DIR / "fixtures"
+MODELS_DIR = FIXTURES_DIR / "models"
+IMAGES_DIR = FIXTURES_DIR / "images"
+CACHE_DIR = TESTS_DIR / ".cache"  # generated, git-ignored
+MODEL_PATH = MODELS_DIR / "ArtCNN_R8F64_fp16.onnx"
 HIP_PROVIDER_SO = Path(
     os.environ.get(
         "HIP_PROVIDER_SO",
@@ -77,15 +82,16 @@ def load_input(res: int) -> np.ndarray:
     """The test image as the fp16 NCHW tensor every backend is fed."""
     import cv2
 
-    img = cv2.imread(str(HERE / f"test_{res}.png"), cv2.IMREAD_GRAYSCALE)
+    img_path = IMAGES_DIR / f"test_{res}.png"
+    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise SystemExit(f"could not read {HERE / f'test_{res}.png'}")
+        raise SystemExit(f"could not read {img_path}")
     x = np.clip(img.astype(np.float32) / 255.0, 0.0, 1.0)
     return x[None, None, :, :].astype(np.float16)
 
 
 def cache_paths(res: int) -> tuple[Path, Path]:
-    return HERE / f".cpu_ref_{res}.npy", HERE / f".cpu_ref_{res}.json"
+    return CACHE_DIR / f"cpu_ref_{res}.npy", CACHE_DIR / f"cpu_ref_{res}.json"
 
 
 def load_reference(res: int, model_sha: str, input_sha: str) -> np.ndarray | None:
@@ -103,6 +109,7 @@ def load_reference(res: int, model_sha: str, input_sha: str) -> np.ndarray | Non
 
 def store_reference(res: int, model_sha: str, input_sha: str, ref: np.ndarray) -> None:
     npy, sidecar = cache_paths(res)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     np.save(npy, ref)
     sidecar.write_text(
         json.dumps(
@@ -224,7 +231,7 @@ def run_worker(res: int, backend: str, args) -> dict:
         str(args.warmup),
     ]
     if backend == "migx":
-        cmd += ["--mxr-cache", str(HERE / ".mxr_cache" / f"res{res}")]
+        cmd += ["--mxr-cache", str(TESTS_DIR / ".mxr_cache" / f"res{res}")]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     for line in proc.stdout.splitlines():
         if line.startswith(MARK):
@@ -290,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         for res in resolutions:
             npy, _ = cache_paths(res)
-            print(f"{res:5d}  input={HERE / f'test_{res}.png'}  reference_cached={npy.exists()}")
+            print(f"{res:5d}  input={IMAGES_DIR / f'test_{res}.png'}  reference_cached={npy.exists()}")
         return 0
 
     frames = 0 if args.no_speed else args.frames

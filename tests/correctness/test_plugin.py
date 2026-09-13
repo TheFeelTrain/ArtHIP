@@ -1,6 +1,6 @@
 """VapourSynth plugin checks.
 
-Covers REVIEW.md P1-1 (subsampled planes and channel mismatches must be refused)
+Covers P1-1 (subsampled planes and channel mismatches must be refused)
 plus the shipped multi-plane model paths:
 
 * ``luma``   - 1 input plane  -> 1 output plane (2x upscale, tail DTS)

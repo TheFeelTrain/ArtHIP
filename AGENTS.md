@@ -29,11 +29,11 @@ VapourSynth filter chain, so raw speed wins.
   no root needed).
 - Provider (ORT EP): `cd src/onnxruntime-hip && ./build.sh`.
 - VapourSynth comparison: `MANGOHUD=0 VS_BACKEND=<hip|migx> vspipe -p
-  "tests/vs_test.py" --` (500 blank 1920x1080 frames; vspipe R79 ignores
+  "tests/tools/vs_test.py" --` (500 blank 1920x1080 frames; vspipe R79 ignores
   script args, so the backend comes from VS_BACKEND, default hip).
-  NOTE: ~20s per backend — run infrequently; use `tests/multires.py` and
+  NOTE: ~20s per backend — run infrequently; use `tests/tools/multires.py` and
   short vspipe runs for iteration.
-- EP accuracy/speed: `MANGOHUD=0 python tests/multires.py 256` (needs an
+- EP accuracy/speed: `MANGOHUD=0 python tests/tools/multires.py 256` (needs an
   ORT venv; until one exists here, run from the parent checkout).
 - Run everything with `MANGOHUD=0`. Numbers are GPU-contention sensitive;
   verify ~2.2GHz sclk during a bench and re-run if a number looks off.
@@ -55,7 +55,7 @@ VapourSynth filter chain, so raw speed wins.
   - Keep it concise — it is the primary context for future sessions, so
     every line should earn its place.
 - NEVER accept a speed result without an accuracy check (photo max absdiff
-  vs MIGX + `tests/multires.py`). Broken or inaccurate variants are invalid,
+  vs MIGX + `tests/tools/multires.py`). Broken or inaccurate variants are invalid,
   timings ignored. Micro-benches/harnesses may locate a bug, but every
   conclusion must still be confirmed on the real model before trusting it.
 - OPTIMIZE AGGRESSIVELY. Do not stop at +10% — keep pushing variants,

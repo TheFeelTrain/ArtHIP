@@ -1,6 +1,6 @@
 """HIP execution-provider checks.
 
-Covers REVIEW.md P1-4 (the fp16->fp32 boundary conversion), P1-6 (device wiring
+Covers P1-4 (the fp16->fp32 boundary conversion), P1-6 (device wiring
 and capability refusal after a failed context init) and the dispatch regression
 that the checked launch status exposes.
 
@@ -105,7 +105,7 @@ def test_ep_rebuilds_for_a_new_input_shape(hip_session, ep_case):
 
 
 def test_p2_11_multichannel_output_layout_is_converted(ep_library, fixtures):
-    """REVIEW.md P2-11: the EP's download path must transpose the NHWC compute
+    """P2-11: the EP's download path must transpose the NHWC compute
     output into ORT's NCHW tensor. C=1 input (identical layout) with M=8 output
     isolates the output conversion.
 
